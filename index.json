@@ -11,13 +11,13 @@
         "name": "Rouman5",
         "packageName": "eu.kanade.tachiyomi.extension.zh.rouman5",
         "resources": {
-          "apkUrl": "https://raw.githubusercontent.com/joker1001s/rouman5-tachimanga/repo/apk/tachiyomi-zh.rouman5-v1.6.6.apk",
+          "apkUrl": "https://raw.githubusercontent.com/joker1001s/rouman5-tachimanga/repo/apk/tachiyomi-zh.rouman5-v1.6.7.apk",
           "iconUrl": "https://raw.githubusercontent.com/joker1001s/rouman5-tachimanga/repo/icon/eu.kanade.tachiyomi.extension.zh.rouman5.png",
-          "jarUrl": "https://raw.githubusercontent.com/joker1001s/rouman5-tachimanga/repo/jar/tachiyomi-zh.rouman5-v1.6.6.jar"
+          "jarUrl": "https://raw.githubusercontent.com/joker1001s/rouman5-tachimanga/repo/jar/tachiyomi-zh.rouman5-v1.6.7.jar"
         },
         "extensionLib": "1.6",
-        "versionCode": 106006,
-        "versionName": "1.6.6",
+        "versionCode": 106007,
+        "versionName": "1.6.7",
         "contentWarning": "CONTENT_WARNING_NSFW",
         "sources": [
           {
