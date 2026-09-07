@@ -340,7 +340,7 @@ abstract class Rouman5 : KeiSource() {
                     .substringAfter("/books/$id/")
                     .trim('/')
     
-                val name = link.text().trim()
+                val name = link.text()
     
                 if (
                     chapterId.isBlank() ||
