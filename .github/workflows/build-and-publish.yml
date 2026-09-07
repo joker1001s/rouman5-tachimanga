@@ -1,0 +1,161 @@
+name: Build Rouman5
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "extension/**"
+      - ".github/workflows/build-and-publish.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Clone current Keiyoushi build environment
+        run: |
+          git clone --depth 1 https://github.com/keiyoushi/extensions-source.git upstream
+
+      - name: Inject Rouman5
+        run: |
+          rm -rf upstream/src/zh/rouman5
+          mkdir -p upstream/src/zh/rouman5
+          cp -a extension/. upstream/src/zh/rouman5/
+
+      - name: Build debug APK
+        working-directory: upstream
+        run: |
+          ./gradlew :src:zh:rouman5:assembleDebug --no-daemon
+
+      - name: Prepare Android signing tool
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" "build-tools;35.0.0" >/dev/null 2>&1 || true
+          echo "$ANDROID_HOME/build-tools/35.0.0" >> "$GITHUB_PATH"
+
+      - name: Decode signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "::error::ANDROID_KEYSTORE_BASE64 is not configured."
+            exit 1
+          fi
+          echo "$KEYSTORE_B64" | base64 --decode > rouman5-release.jks
+
+      - name: Sign APK
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          APK="$(find upstream/src/zh/rouman5/build/outputs/apk/debug -type f -name '*.apk' | head -n 1)"
+          if [ -z "$APK" ]; then
+            echo "::error::APK not found."
+            exit 1
+          fi
+
+          mkdir -p publish
+          cp "$APK" "publish/tachiyomi-zh.rouman5-v1.6.1.apk"
+
+          zipalign -p -f 4 \
+            "publish/tachiyomi-zh.rouman5-v1.6.1.apk" \
+            "publish/aligned.apk"
+
+          mv "publish/aligned.apk" "publish/tachiyomi-zh.rouman5-v1.6.1.apk"
+
+          apksigner sign \
+            --ks rouman5-release.jks \
+            --ks-pass "pass:$KEYSTORE_PASSWORD" \
+            --ks-key-alias "$KEY_ALIAS" \
+            --key-pass "pass:$KEY_PASSWORD" \
+            "publish/tachiyomi-zh.rouman5-v1.6.1.apk"
+
+          apksigner verify --verbose "publish/tachiyomi-zh.rouman5-v1.6.1.apk"
+
+      - name: Generate index
+        run: |
+          set -euo pipefail
+
+          VERSION_CODE="$(grep -E '^    versionCode = ' extension/build.gradle.kts | sed -E 's/.*= ([0-9]+).*/\\1/')"
+          VERSION_NAME="1.6.${VERSION_CODE}"
+          APK_NAME="tachiyomi-zh.rouman5-v${VERSION_NAME}.apk"
+
+          mv publish/tachiyomi-zh.rouman5-v1.6.1.apk "publish/$APK_NAME"
+
+          cat > publish/index.min.json <<EOF
+          [
+            {
+              "name": "Tachiyomi: 肉漫屋",
+              "pkg": "eu.kanade.tachiyomi.extension.zh.rouman5",
+              "apk": "$APK_NAME",
+              "lang": "zh",
+              "code": $VERSION_CODE,
+              "version": "$VERSION_NAME",
+              "nsfw": 1,
+              "hasReadme": 0,
+              "hasChangelog": 0,
+              "sources": [
+                {
+                  "name": "肉漫屋",
+                  "lang": "zh",
+                  "id": "6000000000000099",
+                  "baseUrl": "https://rouman5.com",
+                  "versionId": 1
+                }
+              ]
+            }
+          ]
+          EOF
+
+          python -m json.tool publish/index.min.json >/dev/null
+
+      - name: Publish repo branch
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git fetch origin repo || true
+
+          rm -rf .repo-work
+          if git show-ref --verify --quiet refs/remotes/origin/repo; then
+            git worktree add --detach .repo-work origin/repo
+            cd .repo-work
+            git checkout -B repo
+            find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          else
+            git worktree add --detach .repo-work
+            cd .repo-work
+            git checkout --orphan repo
+            git rm -rf . 2>/dev/null || true
+          fi
+
+          cp ../publish/*.apk .
+          cp ../publish/index.min.json .
+
+          git add .
+          git commit -m "Update Rouman5 extension" || true
+          git push origin HEAD:repo --force
+
+      - name: Cleanup
+        if: always()
+        run: rm -f rouman5-release.jks
