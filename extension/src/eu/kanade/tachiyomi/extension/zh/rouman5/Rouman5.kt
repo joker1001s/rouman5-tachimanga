@@ -318,14 +318,17 @@ abstract class Rouman5 : KeiSource() {
         )
     }
 
-    private fun needsBrowser(doc: Document): Boolean {
-        val text = doc.body().text()
-        return (
-            text.contains("閱讀前，請確認年齡") ||
-                text.contains("阅读前，请确认年龄") ||
-                doc.select("a[href^=/books/]").isEmpty() 
-            ) && text.contains("18+")
-    }
+   private fun needsBrowser(doc: Document): Boolean {
+    val text = doc.body().text()
+    return (
+        text.contains("閱讀前，請確認年齡") ||
+            text.contains("阅读前，请确认年龄") ||
+            (
+                doc.select("a[href^=/books/]").isEmpty() &&
+                    text.contains("18+")
+                )
+        )
+}
 
     private fun extractInfo(text: String, label: String): String {
         val regex = Regex(
