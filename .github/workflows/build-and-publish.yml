@@ -1,4 +1,4 @@
-name: Build Rouman5
+name: Build and Publish Rouman5
 
 on:
   workflow_dispatch:
@@ -15,14 +15,15 @@ permissions:
 
 jobs:
   build:
+    name: Build Rouman5 Extension
     runs-on: ubuntu-latest
     timeout-minutes: 40
 
     steps:
       # ============================================================
-      # 1. Checkout
+      # 1. Checkout 当前项目
       # ============================================================
-      - name: Checkout
+      - name: Checkout Rouman5 project
         uses: actions/checkout@v4
 
       # ============================================================
@@ -35,100 +36,47 @@ jobs:
           java-version: "17"
 
       # ============================================================
-      # 3. Clone latest Keiyoushi build environment
+      # 3. 拉取最新 Keiyoushi extensions-source
       # ============================================================
       - name: Clone current Keiyoushi build environment
         run: |
           set -euo pipefail
 
-          git clone --depth 1 \
+          git clone \
+            --depth 1 \
             https://github.com/keiyoushi/extensions-source.git \
             upstream
 
       # ============================================================
-      # 4. Inject Rouman5 source
+      # 4. 注入 Rouman5 源码
       # ============================================================
-      - name: Inject Rouman5
+      - name: Inject Rouman5 source
         run: |
           set -euo pipefail
 
           rm -rf upstream/src/zh/rouman5
+
           mkdir -p upstream/src/zh/rouman5
 
           cp -a extension/. upstream/src/zh/rouman5/
 
-      # ============================================================
-      # 5. Format source
-      # ============================================================
-      - name: Format source
-        working-directory: upstream
-        run: |
-          set -euo pipefail
+          echo "Rouman5 source injected successfully."
 
-          ./gradlew spotlessApply --no-daemon
+          find upstream/src/zh/rouman5 -maxdepth 2 -type f | sort
 
       # ============================================================
-      # 6. Build debug APK
+      # 5. 准备签名文件
+      #
+      # 注意：
+      # 这里使用你之前已经生成的 rouman5-release.jks
+      #
+      # GitHub Secrets:
+      # ANDROID_KEYSTORE_BASE64
+      # ANDROID_KEYSTORE_PASSWORD
+      # ANDROID_KEY_ALIAS
+      # ANDROID_KEY_PASSWORD
       # ============================================================
-      - name: Build debug APK
-        working-directory: upstream
-        run: |
-          set -euo pipefail
-
-          ./gradlew \
-            :src:zh:rouman5:assembleDebug \
-            --no-daemon
-
-      # ============================================================
-      # 7. Read extension version
-      # ============================================================
-      - name: Read version
-        id: version
-        run: |
-          set -euo pipefail
-
-          VERSION_CODE="$(
-            grep -E '^    versionCode = ' \
-              extension/build.gradle.kts \
-              | sed -E 's/.*= ([0-9]+).*/\1/'
-          )"
-
-          if [ -z "$VERSION_CODE" ]; then
-            echo "::error::Unable to read versionCode."
-            exit 1
-          fi
-
-          VERSION_NAME="1.6.${VERSION_CODE}"
-          APK_NAME="tachiyomi-zh.rouman5-v${VERSION_NAME}.apk"
-
-          echo "VERSION_CODE=$VERSION_CODE" >> "$GITHUB_OUTPUT"
-          echo "VERSION_NAME=$VERSION_NAME" >> "$GITHUB_OUTPUT"
-          echo "APK_NAME=$APK_NAME" >> "$GITHUB_OUTPUT"
-
-          echo "========================================"
-          echo "Version code : $VERSION_CODE"
-          echo "Version name : $VERSION_NAME"
-          echo "APK name     : $APK_NAME"
-          echo "========================================"
-
-      # ============================================================
-      # 8. Prepare Android build tools
-      # ============================================================
-      - name: Prepare Android signing tool
-        run: |
-          set -euo pipefail
-
-          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-
-          yes | "$SDKMANAGER" "build-tools;35.0.0" \
-            >/dev/null 2>&1 || true
-
-          echo "$ANDROID_HOME/build-tools/35.0.0" >> "$GITHUB_PATH"
-
-      # ============================================================
-      # 9. Decode private signing keystore
-      # ============================================================
-      - name: Decode signing key
+      - name: Prepare signing key
         env:
           KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
         run: |
@@ -139,524 +87,1130 @@ jobs:
             exit 1
           fi
 
-          echo "$KEYSTORE_B64" | base64 --decode > rouman5-release.jks
+          echo "$KEYSTORE_B64" | base64 --decode > upstream/signingkey.jks
 
-          if [ ! -s rouman5-release.jks ]; then
-            echo "::error::Keystore file is empty."
+          if [ ! -s upstream/signingkey.jks ]; then
+            echo "::error::signingkey.jks is empty."
             exit 1
           fi
 
-          echo "Keystore decoded successfully."
+          echo "Signing key prepared."
 
       # ============================================================
-      # 10. Sign APK
+      # 6. 检查签名参数
       # ============================================================
-      - name: Sign APK
+      - name: Verify signing configuration
         env:
           KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-          APK_NAME: ${{ steps.version.outputs.APK_NAME }}
         run: |
           set -euo pipefail
 
-          APK="$(
-            find upstream/src/zh/rouman5/build/outputs/apk/debug \
-              -type f \
-              -name '*.apk' \
-              | head -n 1
-          )"
+          if [ -z "$KEYSTORE_PASSWORD" ]; then
+            echo "::error::ANDROID_KEYSTORE_PASSWORD is not configured."
+            exit 1
+          fi
+
+          if [ -z "$KEY_ALIAS" ]; then
+            echo "::error::ANDROID_KEY_ALIAS is not configured."
+            exit 1
+          fi
+
+          if [ -z "$KEY_PASSWORD" ]; then
+            echo "::error::ANDROID_KEY_PASSWORD is not configured."
+            exit 1
+          fi
+
+          keytool \
+            -list \
+            -v \
+            -keystore upstream/signingkey.jks \
+            -alias "$KEY_ALIAS" \
+            -storepass "$KEYSTORE_PASSWORD" \
+            > signing-info.txt
+
+          echo "Signing key information:"
+          grep -E "Alias name:|SHA256:" signing-info.txt || true
+
+      # ============================================================
+      # 7. 格式化 Kotlin
+      # ============================================================
+      - name: Format source
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+
+          ./gradlew spotlessApply --no-daemon
+
+      # ============================================================
+      # 8. Release 编译
+      #
+      # 官方 Keiyoushi CI 当前也是：
+      # assembleRelease
+      #
+      # 这一步会生成：
+      #
+      # APK:
+      # build/outputs/apk/release/*.apk
+      #
+      # JAR:
+      # build/outputs/jar/release/*.jar
+      #
+      # source info:
+      # build/keiyoushi-source-info.json
+      # ============================================================
+      - name: Build Rouman5 release
+        working-directory: upstream
+        env:
+          ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          ./gradlew \
+            :src:zh:rouman5:assembleRelease \
+            --no-daemon
+
+      # ============================================================
+      # 9. 查找构建产物
+      # ============================================================
+      - name: Locate build artifacts
+        id: artifacts
+        run: |
+          set -euo pipefail
+
+          echo "========== APK =========="
+
+          APK="$(find \
+            upstream/src/zh/rouman5/build/outputs/apk/release \
+            -type f \
+            -name '*.apk' \
+            | head -n 1)"
+
+          if [ -z "$APK" ]; then
+            echo "::error::Release APK not found."
+            exit 1
+          fi
+
+          echo "$APK"
+
+          echo "========== JAR =========="
+
+          JAR="$(find \
+            upstream/src/zh/rouman5/build/outputs/jar/release \
+            -type f \
+            -name '*.jar' \
+            | head -n 1)"
+
+          if [ -z "$JAR" ]; then
+            echo "::error::Release JAR not found."
+            exit 1
+          fi
+
+          echo "$JAR"
+
+          echo "========== SOURCE INFO =========="
+
+          SOURCE_INFO="$(find \
+            upstream/src/zh/rouman5/build \
+            -maxdepth 2 \
+            -type f \
+            -name 'keiyoushi-source-info.json' \
+            | head -n 1)"
+
+          if [ -z "$SOURCE_INFO" ]; then
+            echo "::error::keiyoushi-source-info.json not found."
+            exit 1
+          fi
+
+          echo "$SOURCE_INFO"
+
+          mkdir -p publish/apk
+          mkdir -p publish/jar
+
+          cp "$APK" publish/apk/
+          cp "$JAR" publish/jar/
+          cp "$SOURCE_INFO" publish/
+
+          echo "APK=$APK" >> "$GITHUB_OUTPUT"
+          echo "JAR=$JAR" >> "$GITHUB_OUTPUT"
+          echo "SOURCE_INFO=$SOURCE_INFO" >> "$GITHUB_OUTPUT"
+
+      # ============================================================
+      # 10. 验证 APK 签名
+      #
+      # 你之前生成的 SHA-256:
+      #
+      # 84:50:11:20:7D:A0:14:E2:F7:B7:F8:46:80:0E:9D:5F:
+      # 9B:8A:99:7E:EE:7E:12:0C:E8:2F:46:B3:83:26:77:94
+      #
+      # 去掉冒号：
+      #
+      # 845011207da014e2f7b7f846800e9d5f9b8a997eee7e120ce82f46b383267794
+      # ============================================================
+      - name: Verify APK signing fingerprint
+        env:
+          EXPECTED_FINGERPRINT: "845011207da014e2f7b7f846800e9d5f9b8a997eee7e120ce82f46b383267794"
+        run: |
+          set -euo pipefail
+
+          APK="$(find \
+            upstream/src/zh/rouman5/build/outputs/apk/release \
+            -type f \
+            -name '*.apk' \
+            | head -n 1)"
 
           if [ -z "$APK" ]; then
             echo "::error::APK not found."
             exit 1
           fi
 
-          echo "Found APK:"
-          echo "$APK"
+          echo "Checking APK signer..."
 
-          mkdir -p publish/apk
+          APKSIGNER="$ANDROID_HOME/build-tools/35.0.0/apksigner"
 
-          cp "$APK" "publish/apk/$APK_NAME"
+          if [ ! -x "$APKSIGNER" ]; then
+            echo "Installing Android Build Tools 35.0.0..."
 
-          echo "Running zipalign..."
+            SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
 
-          zipalign -p -f 4 \
-            "publish/apk/$APK_NAME" \
-            "publish/apk/aligned.apk"
+            yes | "$SDKMANAGER" \
+              "build-tools;35.0.0" \
+              >/dev/null 2>&1 || true
+          fi
 
-          mv \
-            "publish/apk/aligned.apk" \
-            "publish/apk/$APK_NAME"
-
-          echo "Running apksigner..."
-
-          apksigner sign \
-            --ks rouman5-release.jks \
-            --ks-pass "pass:$KEYSTORE_PASSWORD" \
-            --ks-key-alias "$KEY_ALIAS" \
-            --key-pass "pass:$KEY_PASSWORD" \
-            "publish/apk/$APK_NAME"
-
-          echo "Verifying APK..."
-
-          apksigner verify \
+          "$APKSIGNER" verify \
             --verbose \
-            "publish/apk/$APK_NAME"
+            --print-certs \
+            "$APK" \
+            > apk-cert.txt
 
-          echo "APK signed successfully."
-
-          ls -lh "publish/apk/$APK_NAME"
-
-      # ============================================================
-      # 11. Verify signing certificate fingerprint
-      # ============================================================
-      - name: Verify signing fingerprint
-        env:
-          EXPECTED_FINGERPRINT: "845011207DA014E2F7B7F846800E9D5F9B8A997EEE7E120CE82F46B383267794"
-        run: |
-          set -euo pipefail
-
-          APK="${{ steps.version.outputs.APK_NAME }}"
+          cat apk-cert.txt
 
           ACTUAL_FINGERPRINT="$(
-            apksigner verify \
-              --print-certs \
-              "publish/apk/$APK" \
-              2>/dev/null \
-              | grep "Signer #1 certificate SHA-256 digest:" \
-              | sed 's/.*: //' \
-              | tr -d ':'
+            grep "Signer #1 certificate SHA-256 digest:" apk-cert.txt \
+            | head -n 1 \
+            | sed 's/.*: //' \
+            | tr -d ':' \
+            | tr '[:upper:]' '[:lower:]'
           )"
 
-          ACTUAL_FINGERPRINT="$(echo "$ACTUAL_FINGERPRINT" | tr '[:lower:]' '[:upper:]')"
-          EXPECTED_FINGERPRINT="$(echo "$EXPECTED_FINGERPRINT" | tr '[:lower:]' '[:upper:]')"
-
-          echo "Expected fingerprint:"
-          echo "$EXPECTED_FINGERPRINT"
-
-          echo "Actual fingerprint:"
-          echo "$ACTUAL_FINGERPRINT"
-
-          if [ "$ACTUAL_FINGERPRINT" != "$EXPECTED_FINGERPRINT" ]; then
-            echo "::error::APK signing fingerprint does not match the repository fingerprint."
+          if [ -z "$ACTUAL_FINGERPRINT" ]; then
+            echo "::error::Unable to read APK signer fingerprint."
             exit 1
           fi
 
-          echo "Signing fingerprint verified successfully."
+          echo "Expected:"
+          echo "$EXPECTED_FINGERPRINT"
+
+          echo "Actual:"
+          echo "$ACTUAL_FINGERPRINT"
+
+          if [ "$ACTUAL_FINGERPRINT" != "$EXPECTED_FINGERPRINT" ]; then
+            echo "::error::APK signing fingerprint mismatch!"
+            exit 1
+          fi
+
+          echo "APK signing fingerprint verified successfully."
 
       # ============================================================
-      # 12. Generate standard repository metadata
+      # 11. 准备扩展图标
+      #
+      # 优先：
+      # src/zh/rouman5/res/mipmap-xhdpi/ic_launcher.png
+      #
+      # 如果没有：
+      # 使用 Keiyoushi core 默认图标
       # ============================================================
-      - name: Generate repository metadata
+      - name: Prepare extension icon
+        run: |
+          set -euo pipefail
+
+          mkdir -p publish/icon
+
+          EXTENSION_ICON="upstream/src/zh/rouman5/res/mipmap-xhdpi/ic_launcher.png"
+
+          CORE_ICON="upstream/core/src/main/res/mipmap-xhdpi/ic_launcher.png"
+
+          if [ -f "$EXTENSION_ICON" ]; then
+            echo "Using Rouman5 extension icon:"
+            echo "$EXTENSION_ICON"
+
+            cp \
+              "$EXTENSION_ICON" \
+              "publish/icon/eu.kanade.tachiyomi.extension.zh.rouman5.png"
+
+          elif [ -f "$CORE_ICON" ]; then
+            echo "Rouman5 icon not found."
+
+            echo "Using Keiyoushi core fallback icon:"
+            echo "$CORE_ICON"
+
+            cp \
+              "$CORE_ICON" \
+              "publish/icon/eu.kanade.tachiyomi.extension.zh.rouman5.png"
+
+          else
+            echo "::error::No extension icon found."
+            exit 1
+          fi
+
+          file \
+            publish/icon/eu.kanade.tachiyomi.extension.zh.rouman5.png
+
+          ls -lh publish/icon/
+
+      # ============================================================
+      # 12. 读取扩展 metadata
+      # ============================================================
+      - name: Read extension metadata
+        id: metadata
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          candidates = list(Path("upstream/src/zh/rouman5/build").glob(
+              "**/keiyoushi-source-info.json"
+          ))
+
+          if not candidates:
+              raise SystemExit(
+                  "keiyoushi-source-info.json not found"
+              )
+
+          info_path = candidates[0]
+
+          print("Using metadata file:")
+          print(info_path)
+
+          with info_path.open(
+              "r",
+              encoding="utf-8"
+          ) as f:
+              info = json.load(f)
+
+          print(json.dumps(
+              info,
+              ensure_ascii=False,
+              indent=2
+          ))
+
+          required = [
+              "name",
+              "packageName",
+              "extensionLib",
+              "versionCode",
+              "versionName",
+              "contentWarning",
+              "sources",
+          ]
+
+          for key in required:
+              if key not in info:
+                  raise SystemExit(
+                      f"Missing metadata field: {key}"
+                  )
+
+          package_name = info["packageName"]
+
+          if package_name != "eu.kanade.tachiyomi.extension.zh.rouman5":
+              raise SystemExit(
+                  "Unexpected packageName: "
+                  + package_name
+              )
+
+          if not info["sources"]:
+              raise SystemExit(
+                  "No source information found"
+              )
+
+          source = info["sources"][0]
+
+          print("Package:")
+          print(package_name)
+
+          print("Version code:")
+          print(info["versionCode"])
+
+          print("Version name:")
+          print(info["versionName"])
+
+          print("Source:")
+          print(source)
+
+          with open(
+              os.environ["GITHUB_OUTPUT"],
+              "a",
+              encoding="utf-8"
+          ) as out:
+
+              out.write(
+                  f'PACKAGE_NAME={package_name}\n'
+              )
+
+              out.write(
+                  f'EXTENSION_NAME={info["name"]}\n'
+              )
+
+              out.write(
+                  f'EXTENSION_LIB={info["extensionLib"]}\n'
+              )
+
+              out.write(
+                  f'VERSION_CODE={info["versionCode"]}\n'
+              )
+
+              out.write(
+                  f'VERSION_NAME={info["versionName"]}\n'
+              )
+
+              out.write(
+                  f'SOURCE_NAME={source["name"]}\n'
+              )
+
+              out.write(
+                  f'SOURCE_LANG={source["lang"]}\n'
+              )
+
+              out.write(
+                  f'SOURCE_ID={source["id"]}\n'
+              )
+
+              out.write(
+                  f'SOURCE_BASE_URL={source["baseUrl"]}\n'
+              )
+
+          PY
+
+      # ============================================================
+      # 13. 显示版本信息
+      # ============================================================
+      - name: Show release information
         env:
-          VERSION_CODE: ${{ steps.version.outputs.VERSION_CODE }}
-          VERSION_NAME: ${{ steps.version.outputs.VERSION_NAME }}
-          APK_NAME: ${{ steps.version.outputs.APK_NAME }}
+          PACKAGE_NAME: ${{ steps.metadata.outputs.PACKAGE_NAME }}
+          EXTENSION_NAME: ${{ steps.metadata.outputs.EXTENSION_NAME }}
+          VERSION_CODE: ${{ steps.metadata.outputs.VERSION_CODE }}
+          VERSION_NAME: ${{ steps.metadata.outputs.VERSION_NAME }}
+          SOURCE_NAME: ${{ steps.metadata.outputs.SOURCE_NAME }}
+          SOURCE_ID: ${{ steps.metadata.outputs.SOURCE_ID }}
+          SOURCE_BASE_URL: ${{ steps.metadata.outputs.SOURCE_BASE_URL }}
+        run: |
+          echo "============================================"
+          echo "Rouman5 Release Information"
+          echo "============================================"
+          echo "Package       : $PACKAGE_NAME"
+          echo "Extension     : $EXTENSION_NAME"
+          echo "Version Code  : $VERSION_CODE"
+          echo "Version Name  : $VERSION_NAME"
+          echo "Source Name   : $SOURCE_NAME"
+          echo "Source ID     : $SOURCE_ID"
+          echo "Base URL      : $SOURCE_BASE_URL"
+          echo "============================================"
+
+      # ============================================================
+      # 14. 安装 protobuf
+      # ============================================================
+      - name: Install protobuf Python package
+        run: |
+          python3 -m pip install --upgrade protobuf
+
+      # ============================================================
+      # 15. 下载当前 Keiyoushi protobuf 定义
+      # ============================================================
+      - name: Download current index protobuf definition
+        run: |
+          set -euo pipefail
+
+          curl \
+            -fsSL \
+            https://raw.githubusercontent.com/keiyoushi/extensions-source/main/.github/scripts/index_pb2.py \
+            -o index_pb2.py
+
+          python3 -m py_compile index_pb2.py
+
+          echo "index_pb2.py downloaded successfully."
+
+      # ============================================================
+      # 16. 生成现代 index.pb / index.json
+      #
+      # 关键：
+      #
+      # resources:
+      #   apkUrl
+      #   iconUrl
+      #   jarUrl
+      #
+      # 这一步就是解决当前 Tachimanga:
+      #
+      # Field 'iconUrl' is required
+      #
+      # 同时提前加入 jarUrl。
+      # ============================================================
+      - name: Generate modern repository metadata
+        env:
+          OWNER: "joker1001s"
+          REPO: "rouman5-tachimanga"
+          REPO_BRANCH: "repo"
+
+          PACKAGE_NAME: ${{ steps.metadata.outputs.PACKAGE_NAME }}
+          EXTENSION_NAME: ${{ steps.metadata.outputs.EXTENSION_NAME }}
+          EXTENSION_LIB: ${{ steps.metadata.outputs.EXTENSION_LIB }}
+          VERSION_CODE: ${{ steps.metadata.outputs.VERSION_CODE }}
+          VERSION_NAME: ${{ steps.metadata.outputs.VERSION_NAME }}
+
+          SOURCE_NAME: ${{ steps.metadata.outputs.SOURCE_NAME }}
+          SOURCE_LANG: ${{ steps.metadata.outputs.SOURCE_LANG }}
+          SOURCE_ID: ${{ steps.metadata.outputs.SOURCE_ID }}
+          SOURCE_BASE_URL: ${{ steps.metadata.outputs.SOURCE_BASE_URL }}
 
         run: |
           set -euo pipefail
 
-          mkdir -p publish
-
-          cat > generate_repo.py <<'PY'
+          python3 <<'PY'
           import gzip
           import json
           import os
-          import urllib.request
           from pathlib import Path
 
-          # ------------------------------------------------------------
-          # Configuration
-          # ------------------------------------------------------------
+          import index_pb2
 
-          OWNER = "joker1001s"
-          REPO = "rouman5-tachimanga"
-          BRANCH = "repo"
+          OWNER = os.environ["OWNER"]
+          REPO = os.environ["REPO"]
+          BRANCH = os.environ["REPO_BRANCH"]
 
-          PACKAGE = "eu.kanade.tachiyomi.extension.zh.rouman5"
+          PACKAGE_NAME = os.environ["PACKAGE_NAME"]
+          EXTENSION_NAME = os.environ["EXTENSION_NAME"]
+          EXTENSION_LIB = os.environ["EXTENSION_LIB"]
 
-          EXTENSION_NAME = "肉漫屋"
-          LANGUAGE = "zh"
-
-          SOURCE_ID = 6000000000000099
-          BASE_URL = "https://rouman5.com"
-
-          VERSION_CODE = int(os.environ["VERSION_CODE"])
-          VERSION_NAME = os.environ["VERSION_NAME"]
-          APK_NAME = os.environ["APK_NAME"]
-
-          SIGNING_FINGERPRINT = (
-              "845011207DA014E2F7B7F846800E9D5F"
-              "9B8A997EEE7E120CE82F46B383267794"
-          ).lower()
-
-          APK_URL = (
-              f"https://raw.githubusercontent.com/"
-              f"{OWNER}/{REPO}/{BRANCH}/apk/{APK_NAME}"
+          VERSION_CODE = int(
+              os.environ["VERSION_CODE"]
           )
 
-          REPO_URL = (
+          VERSION_NAME = os.environ["VERSION_NAME"]
+
+          SOURCE_NAME = os.environ["SOURCE_NAME"]
+          SOURCE_LANG = os.environ["SOURCE_LANG"]
+          SOURCE_ID = int(os.environ["SOURCE_ID"])
+          SOURCE_BASE_URL = os.environ["SOURCE_BASE_URL"]
+
+          APK_FILE = next(
+              Path("publish/apk").glob("*.apk")
+          )
+
+          JAR_FILE = next(
+              Path("publish/jar").glob("*.jar")
+          )
+
+          APK_NAME = APK_FILE.name
+          JAR_NAME = JAR_FILE.name
+
+          RAW_BASE = (
               f"https://raw.githubusercontent.com/"
               f"{OWNER}/{REPO}/{BRANCH}"
           )
 
-          # ------------------------------------------------------------
-          # Download current protobuf schema
-          # ------------------------------------------------------------
-
-          index_pb2_url = (
-              "https://raw.githubusercontent.com/"
-              "keiyoushi/extensions-source/main/"
-              ".github/scripts/index_pb2.py"
+          APK_URL = (
+              f"{RAW_BASE}/apk/{APK_NAME}"
           )
 
-          urllib.request.urlretrieve(
-              index_pb2_url,
-              "index_pb2.py",
+          JAR_URL = (
+              f"{RAW_BASE}/jar/{JAR_NAME}"
           )
 
-          # ------------------------------------------------------------
-          # Import protobuf schema
-          # ------------------------------------------------------------
+          ICON_URL = (
+              f"{RAW_BASE}/icon/"
+              f"{PACKAGE_NAME}.png"
+          )
 
-          import sys
-
-          sys.path.insert(0, str(Path.cwd()))
-
-          import index_pb2
-
-          from google.protobuf import json_format
-
-          # ------------------------------------------------------------
-          # Build protobuf source
-          # ------------------------------------------------------------
+          print("============================================")
+          print("Repository URLs")
+          print("============================================")
+          print("APK URL :")
+          print(APK_URL)
+          print()
+          print("JAR URL :")
+          print(JAR_URL)
+          print()
+          print("ICON URL:")
+          print(ICON_URL)
+          print("============================================")
 
           source = index_pb2.Source(
               id=SOURCE_ID,
-              name=EXTENSION_NAME,
-              language=LANGUAGE,
-              homeUrl=BASE_URL,
+              name=SOURCE_NAME,
+              language=SOURCE_LANG,
+              homeUrl=SOURCE_BASE_URL,
+              mirrorUrls=[],
           )
 
           resources = index_pb2.Resources(
               apkUrl=APK_URL,
+              iconUrl=ICON_URL,
+              jarUrl=JAR_URL,
           )
 
           extension = index_pb2.Extension(
               name=EXTENSION_NAME,
-              packageName=PACKAGE,
+              packageName=PACKAGE_NAME,
               resources=resources,
-              extensionLib="1.6",
+              extensionLib=EXTENSION_LIB,
               versionCode=VERSION_CODE,
               versionName=VERSION_NAME,
+
+              # CONTENT_WARNING_NSFW = 3
               contentWarning=3,
+
               sources=[source],
           )
 
           index = index_pb2.Index(
               name="Rouman5",
               badgeLabel="ROU",
-              signingKey=SIGNING_FINGERPRINT,
+              signingKey=(
+                  "845011207da014e2f7b7f846800e9d5f"
+                  "9b8a997eee7e120ce82f46b383267794"
+              ),
               contact=index_pb2.Contact(
-                  website=f"https://github.com/{OWNER}/{REPO}",
+                  website=(
+                      "https://github.com/"
+                      f"{OWNER}/{REPO}"
+                  )
               ),
               extensionList=index_pb2.ExtensionList(
-                  extensions=[extension],
+                  extensions=[extension]
               ),
           )
 
-          # ------------------------------------------------------------
+          # --------------------------------------------------------
           # index.json
-          # ------------------------------------------------------------
+          # --------------------------------------------------------
+          with open(
+              "publish/index.json",
+              "w",
+              encoding="utf-8"
+          ) as f:
 
-          Path("publish/index.json").write_text(
-              json_format.MessageToJson(
-                  index,
-                  always_print_fields_with_no_presence=False,
-                  preserving_proto_field_name=True,
-              ),
-              encoding="utf-8",
+              json.dump(
+                  {
+                      "name": "Rouman5",
+                      "badgeLabel": "ROU",
+                      "signingKey": (
+                          "845011207da014e2f7b7f846800e9d5f"
+                          "9b8a997eee7e120ce82f46b383267794"
+                      ),
+                      "contact": {
+                          "website": (
+                              "https://github.com/"
+                              f"{OWNER}/{REPO}"
+                          )
+                      },
+                      "extensionList": {
+                          "extensions": [
+                              {
+                                  "name": EXTENSION_NAME,
+                                  "packageName": PACKAGE_NAME,
+                                  "resources": {
+                                      "apkUrl": APK_URL,
+                                      "iconUrl": ICON_URL,
+                                      "jarUrl": JAR_URL,
+                                  },
+                                  "extensionLib": EXTENSION_LIB,
+                                  "versionCode": VERSION_CODE,
+                                  "versionName": VERSION_NAME,
+                                  "contentWarning": (
+                                      "CONTENT_WARNING_NSFW"
+                                  ),
+                                  "sources": [
+                                      {
+                                          "id": SOURCE_ID,
+                                          "name": SOURCE_NAME,
+                                          "language": SOURCE_LANG,
+                                          "homeUrl": SOURCE_BASE_URL,
+                                          "mirrorUrls": [],
+                                      }
+                                  ],
+                              }
+                          ]
+                      }
+                  },
+                  f,
+                  ensure_ascii=False,
+                  indent=2,
+              )
+
+              f.write("\n")
+
+          # --------------------------------------------------------
+          # index.pb
+          # --------------------------------------------------------
+          protobuf_data = index.SerializeToString(
+              deterministic=True
           )
 
-          # ------------------------------------------------------------
-          # index.pb
-          #
-          # Same gzip-compressed protobuf format used by the current
-          # Keiyoushi repository.
-          # ------------------------------------------------------------
+          with open(
+              "publish/index.pb",
+              "wb"
+          ) as f:
 
-          with open("publish/index.pb", "wb") as f:
               f.write(
                   gzip.compress(
-                      index.SerializeToString(
-                          deterministic=True
-                      ),
+                      protobuf_data,
                       mtime=0,
                   )
               )
 
-          # ------------------------------------------------------------
-          # index.min.json
-          #
-          # Legacy Tachiyomi/Tachimanga repository format.
-          # ------------------------------------------------------------
+          print("index.json generated.")
+          print("index.pb generated.")
 
-          legacy = [
+          PY
+
+      # ============================================================
+      # 17. 生成兼容旧版 Tachiyomi/Tachimanga 的 index.min.json
+      #
+      # 注意：
+      # 这里故意保留传统格式。
+      #
+      # 新版信息放在：
+      # index.pb
+      # index.json
+      # repo.json
+      #
+      # 旧版信息放在：
+      # index.min.json
+      # ============================================================
+      - name: Generate legacy index.min.json
+        env:
+          PACKAGE_NAME: ${{ steps.metadata.outputs.PACKAGE_NAME }}
+          EXTENSION_NAME: ${{ steps.metadata.outputs.EXTENSION_NAME }}
+          VERSION_CODE: ${{ steps.metadata.outputs.VERSION_CODE }}
+          VERSION_NAME: ${{ steps.metadata.outputs.VERSION_NAME }}
+
+          SOURCE_NAME: ${{ steps.metadata.outputs.SOURCE_NAME }}
+          SOURCE_LANG: ${{ steps.metadata.outputs.SOURCE_LANG }}
+          SOURCE_ID: ${{ steps.metadata.outputs.SOURCE_ID }}
+          SOURCE_BASE_URL: ${{ steps.metadata.outputs.SOURCE_BASE_URL }}
+
+        run: |
+          set -euo pipefail
+
+          APK_NAME="$(basename publish/apk/*.apk)"
+
+          python3 <<'PY'
+          import json
+          import os
+
+          PACKAGE_NAME = os.environ["PACKAGE_NAME"]
+          EXTENSION_NAME = os.environ["EXTENSION_NAME"]
+
+          VERSION_CODE = int(
+              os.environ["VERSION_CODE"]
+          )
+
+          VERSION_NAME = os.environ["VERSION_NAME"]
+
+          SOURCE_NAME = os.environ["SOURCE_NAME"]
+          SOURCE_LANG = os.environ["SOURCE_LANG"]
+          SOURCE_ID = os.environ["SOURCE_ID"]
+          SOURCE_BASE_URL = os.environ["SOURCE_BASE_URL"]
+
+          APK_NAME = os.environ.get(
+              "APK_NAME"
+          )
+
+          if not APK_NAME:
+              import glob
+              files = glob.glob(
+                  "publish/apk/*.apk"
+              )
+
+              if not files:
+                  raise SystemExit(
+                      "APK not found"
+                  )
+
+              APK_NAME = files[0].split("/")[-1]
+
+          data = [
               {
-                  "name": f"Tachiyomi: {EXTENSION_NAME}",
-                  "pkg": PACKAGE,
+                  "name": (
+                      f"Tachiyomi: "
+                      f"{EXTENSION_NAME}"
+                  ),
+
+                  "pkg": PACKAGE_NAME,
+
                   "apk": APK_NAME,
-                  "lang": LANGUAGE,
+
+                  "lang": SOURCE_LANG,
+
                   "code": VERSION_CODE,
+
                   "version": VERSION_NAME,
+
                   "nsfw": 1,
+
                   "hasReadme": 0,
+
                   "hasChangelog": 0,
+
                   "sources": [
                       {
-                          "name": EXTENSION_NAME,
-                          "lang": LANGUAGE,
+                          "name": SOURCE_NAME,
+                          "lang": SOURCE_LANG,
                           "id": str(SOURCE_ID),
-                          "baseUrl": BASE_URL,
+                          "baseUrl": SOURCE_BASE_URL,
+                          "versionId": 1,
                       }
                   ],
               }
           ]
 
-          Path("publish/index.min.json").write_text(
-              json.dumps(
-                  legacy,
-                  ensure_ascii=False,
-                  separators=(",", ":"),
-              ),
-              encoding="utf-8",
-          )
+          with open(
+              "publish/index.min.json",
+              "w",
+              encoding="utf-8"
+          ) as f:
 
-          # ------------------------------------------------------------
-          # repo.json
-          #
-          # This is the important file that was missing before.
-          # Tachimanga/Mihon uses signingKeyFingerprint to trust
-          # extensions from this repository.
-          # ------------------------------------------------------------
-
-          repo_json = {
-              "index_v2": f"{REPO_URL}/index.pb",
-              "meta": {
-                  "name": "Rouman5",
-                  "shortName": "Rouman5",
-                  "website": f"https://github.com/{OWNER}/{REPO}",
-                  "signingKeyFingerprint": SIGNING_FINGERPRINT,
-              },
-          }
-
-          Path("publish/repo.json").write_text(
-              json.dumps(
-                  repo_json,
+              json.dump(
+                  data,
+                  f,
                   ensure_ascii=False,
                   indent=2,
-              ) + "\n",
-              encoding="utf-8",
-          )
-
-          # ------------------------------------------------------------
-          # index.html
-          # ------------------------------------------------------------
-
-          html = f"""<!DOCTYPE html>
-          <html>
-          <head>
-          <meta charset="UTF-8">
-          <title>Rouman5 Extension Repository</title>
-          </head>
-          <body>
-          <h1>Rouman5 Extension Repository</h1>
-          <p>
-          <a href="{APK_URL}">
-          Tachiyomi: {EXTENSION_NAME}
-          </a>
-          </p>
-          </body>
-          </html>
-          """
-
-          Path("publish/index.html").write_text(
-              html,
-              encoding="utf-8",
-          )
-
-          # ------------------------------------------------------------
-          # Validate JSON
-          # ------------------------------------------------------------
-
-          json.loads(
-              Path("publish/index.json").read_text(
-                  encoding="utf-8"
               )
+
+              f.write("\n")
+
+          print(
+              "index.min.json generated."
           )
 
-          json.loads(
-              Path("publish/index.min.json").read_text(
-                  encoding="utf-8"
-              )
-          )
-
-          json.loads(
-              Path("publish/repo.json").read_text(
-                  encoding="utf-8"
-              )
-          )
-
-          print("========================================")
-          print("Repository generated successfully.")
-          print("========================================")
-          print("APK:")
-          print(APK_URL)
-          print("")
-          print("Index:")
-          print(f"{REPO_URL}/index.pb")
-          print("")
-          print("Fingerprint:")
-          print(SIGNING_FINGERPRINT)
-          print("========================================")
           PY
 
-          python -m pip install --upgrade "protobuf==7.35.1"
-
-          python generate_repo.py
-
-          echo ""
-          echo "Generated files:"
-          find publish -maxdepth 2 -type f -print
-
-          echo ""
-          echo "repo.json:"
-          cat publish/repo.json
-
-          echo ""
-          echo "index.min.json:"
-          cat publish/index.min.json
-
       # ============================================================
-      # 13. Verify generated repository
+      # 18. 生成 repo.json
+      #
+      # Tachimanga / Mihon 类客户端需要：
+      #
+      # meta.signingKeyFingerprint
       # ============================================================
-      - name: Verify repository
+      - name: Generate repo.json
         run: |
           set -euo pipefail
 
-          test -f publish/repo.json
-          test -f publish/index.pb
-          test -f publish/index.json
-          test -f publish/index.min.json
-          test -f "publish/apk/${{ steps.version.outputs.APK_NAME }}"
+          cat > publish/repo.json <<'EOF'
+          {
+            "index_v2": "https://raw.githubusercontent.com/joker1001s/rouman5-tachimanga/repo/index.pb",
+            "meta": {
+              "name": "Rouman5",
+              "shortName": "Rouman5",
+              "website": "https://github.com/joker1001s/rouman5-tachimanga",
+              "signingKeyFingerprint": "845011207da014e2f7b7f846800e9d5f9b8a997eee7e120ce82f46b383267794"
+            }
+          }
+          EOF
 
-          echo "Repository files verified."
-
-          echo ""
-          echo "Repository:"
-          ls -lh publish/
-
-          echo ""
-          echo "APK:"
-          ls -lh publish/apk/
+          cat publish/repo.json
 
       # ============================================================
-      # 14. Publish repo branch
+      # 19. 生成简单 index.html
       # ============================================================
-      - name: Publish repo branch
+      - name: Generate index.html
+        env:
+          PACKAGE_NAME: ${{ steps.metadata.outputs.PACKAGE_NAME }}
+          EXTENSION_NAME: ${{ steps.metadata.outputs.EXTENSION_NAME }}
+        run: |
+          set -euo pipefail
+
+          APK_NAME="$(basename publish/apk/*.apk)"
+
+          cat > publish/index.html <<EOF
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <meta charset="UTF-8">
+            <title>Rouman5 Extension Repository</title>
+          </head>
+          <body>
+            <h1>Rouman5 Extension Repository</h1>
+
+            <p>
+              Extension:
+              ${EXTENSION_NAME}
+            </p>
+
+            <p>
+              Package:
+              ${PACKAGE_NAME}
+            </p>
+
+            <p>
+              <a href="apk/${APK_NAME}">
+                Download APK
+              </a>
+            </p>
+
+            <p>
+              <a href="index.pb">
+                index.pb
+              </a>
+            </p>
+
+            <p>
+              <a href="index.json">
+                index.json
+              </a>
+            </p>
+
+            <p>
+              <a href="index.min.json">
+                index.min.json
+              </a>
+            </p>
+
+          </body>
+          </html>
+          EOF
+
+      # ============================================================
+      # 20. 检查最终 publish 文件
+      # ============================================================
+      - name: Validate repository files
+        run: |
+          set -euo pipefail
+
+          echo "============================================"
+          echo "Publish directory"
+          echo "============================================"
+
+          find publish \
+            -maxdepth 3 \
+            -type f \
+            -print \
+            | sort
+
+          echo
+          echo "============================================"
+          echo "repo.json"
+          echo "============================================"
+
+          cat publish/repo.json
+
+          echo
+          echo "============================================"
+          echo "index.json"
+          echo "============================================"
+
+          cat publish/index.json
+
+          echo
+          echo "============================================"
+          echo "index.min.json"
+          echo "============================================"
+
+          cat publish/index.min.json
+
+          echo
+          echo "============================================"
+          echo "Check required files"
+          echo "============================================"
+
+          test -s publish/index.pb
+          test -s publish/index.json
+          test -s publish/index.min.json
+          test -s publish/repo.json
+          test -s publish/index.html
+
+          test -n "$(find publish/apk -type f -name '*.apk' | head -n 1)"
+          test -n "$(find publish/jar -type f -name '*.jar' | head -n 1)"
+          test -n "$(find publish/icon -type f -name '*.png' | head -n 1)"
+
+          echo
+          echo "All repository files validated successfully."
+
+      # ============================================================
+      # 21. 下载 GitHub repo 分支
+      # ============================================================
+      - name: Checkout repo branch
+        uses: actions/checkout@v4
+        with:
+          repository: joker1001s/rouman5-tachimanga
+          ref: repo
+          path: repo-branch
+          token: ${{ github.token }}
+
+      # ============================================================
+      # 22. 更新 repo 分支
+      # ============================================================
+      - name: Publish repository
+        run: |
+          set -euo pipefail
+
+          cd repo-branch
+
+          echo "Cleaning old repository files..."
+
+          rm -rf apk
+          rm -rf jar
+          rm -rf icon
+
+          rm -f index.pb
+          rm -f index.json
+          rm -f index.min.json
+          rm -f repo.json
+          rm -f index.html
+
+          mkdir -p apk
+          mkdir -p jar
+          mkdir -p icon
+
+          echo "Copying APK..."
+
+          cp \
+            ../publish/apk/*.apk \
+            apk/
+
+          echo "Copying JAR..."
+
+          cp \
+            ../publish/jar/*.jar \
+            jar/
+
+          echo "Copying icon..."
+
+          cp \
+            ../publish/icon/*.png \
+            icon/
+
+          echo "Copying repository metadata..."
+
+          cp \
+            ../publish/index.pb \
+            .
+
+          cp \
+            ../publish/index.json \
+            .
+
+          cp \
+            ../publish/index.min.json \
+            .
+
+          cp \
+            ../publish/repo.json \
+            .
+
+          cp \
+            ../publish/index.html \
+            .
+
+          echo
+          echo "============================================"
+          echo "Final repo branch contents"
+          echo "============================================"
+
+          find . \
+            -maxdepth 2 \
+            -type f \
+            -print \
+            | sort
+
+      # ============================================================
+      # 23. 验证 repo 分支文件
+      # ============================================================
+      - name: Validate published repository
+        working-directory: repo-branch
+        run: |
+          set -euo pipefail
+
+          test -s index.pb
+          test -s index.json
+          test -s index.min.json
+          test -s repo.json
+          test -s index.html
+
+          APK="$(find apk -type f -name '*.apk' | head -n 1)"
+
+          JAR="$(find jar -type f -name '*.jar' | head -n 1)"
+
+          ICON="$(find icon -type f -name '*.png' | head -n 1)"
+
+          if [ -z "$APK" ]; then
+            echo "::error::Published APK not found."
+            exit 1
+          fi
+
+          if [ -z "$JAR" ]; then
+            echo "::error::Published JAR not found."
+            exit 1
+          fi
+
+          if [ -z "$ICON" ]; then
+            echo "::error::Published icon not found."
+            exit 1
+          fi
+
+          echo "Published APK : $APK"
+          echo "Published JAR : $JAR"
+          echo "Published ICON: $ICON"
+
+          echo
+          echo "repo.json:"
+          cat repo.json
+
+      # ============================================================
+      # 24. 提交 repo 分支
+      # ============================================================
+      - name: Commit and push repository
+        working-directory: repo-branch
         run: |
           set -euo pipefail
 
           git config user.name "github-actions[bot]"
-          git config user.email \
-            "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git fetch origin repo || true
-
-          rm -rf .repo-work
-
-          if git show-ref --verify --quiet refs/remotes/origin/repo; then
-
-            echo "Existing repo branch found."
-
-            git worktree add \
-              --detach \
-              .repo-work \
-              origin/repo
-
-            cd .repo-work
-
-            git checkout -B repo
-
-          else
-
-            echo "Creating repo branch."
-
-            git worktree add \
-              --detach \
-              .repo-work
-
-            cd .repo-work
-
-            git checkout --orphan repo
-
-            git rm -rf . 2>/dev/null || true
-
-          fi
-
-          # ----------------------------------------------------------
-          # Clean old repository files
-          # ----------------------------------------------------------
-
-          find . \
-            -mindepth 1 \
-            -maxdepth 1 \
-            ! -name ".git" \
-            -exec rm -rf {} +
-
-          # ----------------------------------------------------------
-          # Copy new repository
-          # ----------------------------------------------------------
-
-          mkdir -p apk
-
-          cp ../publish/apk/*.apk apk/
-
-          cp ../publish/repo.json .
-          cp ../publish/index.pb .
-          cp ../publish/index.json .
-          cp ../publish/index.min.json .
-          cp ../publish/index.html .
-
-          # ----------------------------------------------------------
-          # Show final structure
-          # ----------------------------------------------------------
-
-          echo ""
-          echo "Final repo branch:"
-          find . -maxdepth 2 -type f | sort
-
-          # ----------------------------------------------------------
-          # Commit
-          # ----------------------------------------------------------
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add .
 
+          if git diff --cached --quiet; then
+            echo "No repository changes detected."
+            exit 0
+          fi
+
           git commit \
-            -m "Update Rouman5 extension" \
-            || true
+            -m "Update Rouman5 extension repository"
 
-          git push origin HEAD:repo --force
-
-          echo ""
-          echo "Repo branch published successfully."
+          git push origin repo
 
       # ============================================================
-      # 15. Cleanup
+      # 25. 输出最终地址
       # ============================================================
-      - name: Cleanup
-        if: always()
+      - name: Show repository URLs
+        env:
+          VERSION_NAME: ${{ steps.metadata.outputs.VERSION_NAME }}
         run: |
-          rm -f rouman5-release.jks
-          rm -f generate_repo.py
+          echo
+          echo "============================================================"
+          echo "Rouman5 repository published successfully"
+          echo "============================================================"
+          echo
+          echo "Tachimanga / Mihon repository:"
+          echo
+          echo "https://raw.githubusercontent.com/joker1001s/rouman5-tachimanga/repo/index.pb"
+          echo
+          echo "Legacy repository:"
+          echo
+          echo "https://raw.githubusercontent.com/joker1001s/rouman5-tachimanga/repo/index.min.json"
+          echo
+          echo "Repository metadata:"
+          echo
+          echo "https://raw.githubusercontent.com/joker1001s/rouman5-tachimanga/repo/repo.json"
+          echo
+          echo "Version:"
+          echo "$VERSION_NAME"
+          echo
+          echo "============================================================"
