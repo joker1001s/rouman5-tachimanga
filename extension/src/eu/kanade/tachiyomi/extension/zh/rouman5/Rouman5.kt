@@ -335,13 +335,13 @@ abstract class Rouman5 : KeiSource() {
             .select("a[href^=/books/$id/]")
             .mapNotNull { link ->
                 val href = link.attr("href")
-
+    
                 val chapterId = href
                     .substringAfter("/books/$id/")
                     .trim('/')
-
+    
                 val name = link.text().trim()
-
+    
                 if (
                     chapterId.isBlank() ||
                     chapterId.contains('/') ||
@@ -349,10 +349,12 @@ abstract class Rouman5 : KeiSource() {
                 ) {
                     null
                 } else {
-                    SChapter.create(
-                        url = "$id/$chapterId",
-                        name = name,
-                    )
+                    SChapter.create().apply {
+                        setUrlWithoutDomain(
+                            "$baseUrl/books/$id/$chapterId",
+                        )
+                        this.name = name
+                    }
                 }
             }
             .distinctBy { it.url }
