@@ -6,7 +6,6 @@ import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
-import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.annotation.Source
 import keiyoushi.network.get
 import keiyoushi.source.KeiSource
@@ -17,6 +16,8 @@ import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import java.net.URLEncoder
 import java.util.Locale
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.seconds
 
 @Source
 abstract class Rouman5 : KeiSource() {
@@ -57,43 +58,21 @@ abstract class Rouman5 : KeiSource() {
             Charsets.UTF_8,
         )
 
-        val candidates = listOf(
-            "$baseUrl/search?keyword=$encoded&page=${page - 1}",
-            "$baseUrl/search?q=$encoded&page=${page - 1}",
-            "$baseUrl/search?term=$encoded&page=${page - 1}",
-        )
+        val url =
+            "$baseUrl/search?term=$encoded"
 
-        for (url in candidates) {
-            val result = getMangaList(url)
-
-            if (
-                result.mangas.isNotEmpty() ||
-                url == candidates.last()
-            ) {
-                return result
-            }
-        }
-
-        return MangasPage(
-            emptyList(),
-            false,
-        )
+        return getMangaList(url)
     }
 
     // ============================================================
-    // Manga URL
+    // Manga details
     // ============================================================
 
     override suspend fun getMangaByUrl(
         url: HttpUrl,
     ): SManga? {
-        val host = baseUrl.toHttpUrl().host
 
-        if (url.host != host) {
-            return null
-        }
-
-        val id = extractMangaIdFromPath(
+        val id = extractMangaId(
             url.encodedPath,
         )
 
@@ -103,50 +82,51 @@ abstract class Rouman5 : KeiSource() {
 
         val mangaUrl = "$baseUrl/books/$id"
 
-        // --------------------------------------------------------
-        // 第一阶段：普通 HTTP
-        // --------------------------------------------------------
+        // First try normal HTTP.
+        val document = fetchDocument(
+            mangaUrl,
+        )
 
-        val httpDocument = runCatching {
-            client
-                .get(mangaUrl)
-                .asJsoup()
-        }.getOrNull()
+        if (document != null) {
+            val manga = runCatching {
+                parseManga(
+                    document,
+                    id,
+                )
+            }.getOrNull()
 
-        if (httpDocument != null) {
-            val manga = parseManga(
-                httpDocument,
-                id,
+            val chapters = runCatching {
+                parseChapters(
+                    document,
+                    id,
+                )
+            }.getOrDefault(
+                emptyList(),
             )
 
             if (
-                manga.title.isNotBlank() &&
-                parseChapters(
-                    httpDocument,
-                    id,
-                ).isNotEmpty()
+                manga != null &&
+                    manga.title.isNotBlank() &&
+                    chapters.isNotEmpty()
             ) {
                 return manga
             }
         }
 
-        // --------------------------------------------------------
-        // 第二阶段：WebView
-        //
-        // 肉漫屋部分情况下普通 HTTP 得到的页面
-        // 与真实浏览器页面不同，因此这里自动 fallback。
-        // --------------------------------------------------------
-
-        val webDocument = fetchDocumentWithWebView(
-            mangaUrl,
-            requireChapters = true,
-        )
+        // Fallback to WebView.
+        val webDocument =
+            fetchDocumentWithWebView(
+                mangaUrl,
+                requireChapters = true,
+            )
 
         if (webDocument != null) {
-            return parseManga(
-                webDocument,
-                id,
-            )
+            return runCatching {
+                parseManga(
+                    webDocument,
+                    id,
+                )
+            }.getOrNull()
         }
 
         return null
@@ -175,30 +155,25 @@ abstract class Rouman5 : KeiSource() {
 
         val mangaUrl = "$baseUrl/books/$id"
 
-        // --------------------------------------------------------
-        // 普通 HTTP
-        // --------------------------------------------------------
+        var document = fetchDocument(
+            mangaUrl,
+        )
 
-        var document = runCatching {
-            client
-                .get(mangaUrl)
-                .asJsoup()
-        }.getOrNull()
-
-        var parsedManga: SManga? = null
-        var parsedChapters: List<SChapter> = emptyList()
+        var details: SManga? = null
+        var updatedChapters: List<SChapter> =
+            emptyList()
 
         if (document != null) {
-            parsedManga = runCatching {
+            details = runCatching {
                 parseManga(
-                    document!!,
+                    document,
                     id,
                 )
             }.getOrNull()
 
-            parsedChapters = runCatching {
+            updatedChapters = runCatching {
                 parseChapters(
-                    document!!,
+                    document,
                     id,
                 )
             }.getOrDefault(
@@ -206,36 +181,34 @@ abstract class Rouman5 : KeiSource() {
             )
         }
 
-        // --------------------------------------------------------
-        // 如果标题或者章节没有正确取得，
-        // 自动切换到 WebView。
-        // --------------------------------------------------------
-
+        // If the normal HTTP response is incomplete,
+        // use a real WebView.
         val needWebView =
-            parsedManga == null ||
-                parsedManga!!.title.isBlank() ||
+            details == null ||
+                details.title.isBlank() ||
                 (
                     fetchChapters &&
-                        parsedChapters.isEmpty()
+                        updatedChapters.isEmpty()
                     )
 
         if (needWebView) {
-            document = fetchDocumentWithWebView(
-                mangaUrl,
-                requireChapters = fetchChapters,
-            )
+            document =
+                fetchDocumentWithWebView(
+                    mangaUrl,
+                    requireChapters = fetchChapters,
+                )
 
             if (document != null) {
-                parsedManga = runCatching {
+                details = runCatching {
                     parseManga(
-                        document!!,
+                        document,
                         id,
                     )
                 }.getOrNull()
 
-                parsedChapters = runCatching {
+                updatedChapters = runCatching {
                     parseChapters(
-                        document!!,
+                        document,
                         id,
                     )
                 }.getOrDefault(
@@ -244,38 +217,38 @@ abstract class Rouman5 : KeiSource() {
             }
         }
 
-        // --------------------------------------------------------
-        // 强制检查标题
-        // --------------------------------------------------------
+        val finalManga =
+            if (
+                fetchDetails &&
+                    details != null
+            ) {
+                details
+            } else {
+                manga
+            }
 
-        val details = parsedManga ?: manga
-
-        if (fetchDetails && details.title.isBlank()) {
+        if (finalManga.title.isBlank()) {
             throw IllegalStateException(
                 "Missing manga title: $mangaUrl",
             )
         }
 
-        // --------------------------------------------------------
-        // 强制检查章节
-        // --------------------------------------------------------
-
-        val updatedChapters =
+        val finalChapters =
             if (fetchChapters) {
-                if (parsedChapters.isEmpty()) {
+                if (updatedChapters.isEmpty()) {
                     throw IllegalStateException(
                         "No chapters found: $mangaUrl",
                     )
                 }
 
-                parsedChapters
+                updatedChapters
             } else {
                 chapters
             }
 
         return SMangaUpdate(
-            details,
-            updatedChapters,
+            finalManga,
+            finalChapters,
         )
     }
 
@@ -287,146 +260,132 @@ abstract class Rouman5 : KeiSource() {
         chapter: SChapter,
     ): List<Page> {
 
-        val chapterUrl = getChapterUrl(
-            chapter,
-        )
+        val chapterUrl =
+            getChapterUrl(chapter)
 
-        val result = withTimeoutOrNull(
-            45_000L,
-        ) {
-            runWebView<String> {
+        val result =
+            withTimeoutOrNull(
+                45.seconds,
+            ) {
+                runWebView<String> {
 
-                javaScriptEnabled = true
-                domStorageEnabled = true
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
 
-                loadUrl(
-                    chapterUrl,
-                )
+                    loadUrl(chapterUrl)
 
-                onPageFinished {
+                    onPageFinished {
 
-                    poll(500) {
+                        poll(
+                            500.milliseconds,
+                        ) {
 
-                        evaluateJs(
-                            """
-                            (() => {
+                            evaluateJs(
+                                """
+                                (() => {
+                                    const buttons =
+                                        Array.from(
+                                            document.querySelectorAll(
+                                                "button, a"
+                                            )
+                                        );
 
-                                // 自动点击 18+ 确认
-                                const buttons =
-                                    Array.from(
-                                        document.querySelectorAll(
-                                            "button, a"
+                                    const gate =
+                                        buttons.find(
+                                            el => {
+                                                const text =
+                                                    (
+                                                        el.innerText ||
+                                                        el.textContent ||
+                                                        ""
+                                                    ).trim();
+
+                                                return (
+                                                    text.includes("我已滿18歲") ||
+                                                    text.includes("我已滿 18 歲") ||
+                                                    text.includes("我已满18岁") ||
+                                                    text.includes("我已满 18 岁") ||
+                                                    text === "進入" ||
+                                                    text === "进入"
+                                                );
+                                            }
+                                        );
+
+                                    if (gate) {
+                                        gate.click();
+                                    }
+
+                                    window.scrollTo(
+                                        0,
+                                        document.body.scrollHeight
+                                    );
+
+                                    const images =
+                                        Array.from(
+                                            document.images
                                         )
-                                    );
+                                        .map(
+                                            img =>
+                                                img.currentSrc ||
+                                                img.src ||
+                                                img.getAttribute("data-src") ||
+                                                img.getAttribute("data-original") ||
+                                                ""
+                                        )
+                                        .filter(
+                                            url =>
+                                                url &&
+                                                !url.startsWith("data:") &&
+                                                !url.includes("loading") &&
+                                                !url.includes("logo")
+                                        );
 
-                                const gate =
-                                    buttons.find(
-                                        el => {
-                                            const text =
-                                                (
-                                                    el.innerText ||
-                                                    el.textContent ||
-                                                    ""
-                                                ).trim();
-
-                                            return (
-                                                text.includes("我已滿18歲") ||
-                                                text.includes("我已滿 18 歲") ||
-                                                text.includes("我已满18岁") ||
-                                                text.includes("我已满 18 岁") ||
-                                                text.includes("進入") ||
-                                                text.includes("进入")
-                                            );
-                                        }
-                                    );
-
-                                if (gate) {
-                                    gate.click();
-                                }
-
-                                // 尝试滚动到底部，
-                                // 触发 lazy-load 图片。
-                                window.scrollTo(
-                                    0,
-                                    document.body.scrollHeight
-                                );
-
-                                const images =
-                                    Array.from(
-                                        document.images
-                                    )
-                                    .map(
-                                        img =>
-                                            img.currentSrc ||
-                                            img.src ||
-                                            img.dataset.src ||
-                                            img.dataset.original ||
-                                            ""
-                                    )
-                                    .filter(
-                                        url =>
-                                            url &&
-                                            !url.startsWith("data:") &&
-                                            !url.includes("loading.jpg") &&
-                                            !url.includes("logo")
-                                    );
-
-                                if (images.length > 0) {
                                     return [
                                         ...new Set(images)
                                     ].join("\\n");
+                                })();
+                                """.trimIndent(),
+                            ) { value ->
+
+                                if (
+                                    value.isNotBlank()
+                                ) {
+                                    resolve(value)
                                 }
-
-                                return "";
-                            })();
-                            """.trimIndent(),
-                        ) { value ->
-
-                            if (
-                                value.isNotBlank()
-                            ) {
-                                resolve(
-                                    value,
-                                )
                             }
                         }
                     }
                 }
             }
-        }
 
-        val urls = result
-            ?.replace(
-                "\\n",
-                "\n",
-            )
-            ?.removePrefix("\"")
-            ?.removeSuffix("\"")
-            ?.split('\n')
-            ?.map {
-                it.trim()
-            }
-            ?.filter {
-                it.startsWith(
-                    "https://",
-                ) ||
-                    it.startsWith(
-                        "http://",
+        val urls =
+            result
+                ?.trim()
+                ?.removePrefix("\"")
+                ?.removeSuffix("\"")
+                ?.replace("\\n", "\n")
+                ?.split('\n')
+                ?.map {
+                    it.trim()
+                }
+                ?.filter {
+                    it.startsWith("https://") ||
+                        it.startsWith("http://")
+                }
+                ?.filterNot {
+                    it.contains(
+                        "loading",
+                        ignoreCase = true,
                     )
-            }
-            ?.filterNot {
-                it.contains(
-                    "loading.jpg",
-                )
-            }
-            ?.filterNot {
-                it.contains(
-                    "logo",
-                    ignoreCase = true,
-                )
-            }
-            ?.distinct()
-            .orEmpty()
+                }
+                ?.filterNot {
+                    it.contains(
+                        "logo",
+                        ignoreCase = true,
+                    )
+                }
+                ?.distinct()
+                .orEmpty()
 
         return urls.mapIndexed {
                 index,
@@ -435,24 +394,29 @@ abstract class Rouman5 : KeiSource() {
             Page(
                 index,
                 imageUrl = imageUrl,
-                url = imageUrl,
             )
         }
     }
 
     // ============================================================
-    // URL helpers
+    // Manga URL
     // ============================================================
 
     override fun getMangaUrl(
         manga: SManga,
     ): String {
-        val id = extractMangaId(
-            manga.url,
-        )
+
+        val id =
+            extractMangaId(
+                manga.url,
+            )
 
         return "$baseUrl/books/$id"
     }
+
+    // ============================================================
+    // Chapter URL
+    // ============================================================
 
     override fun getChapterUrl(
         chapter: SChapter,
@@ -461,21 +425,17 @@ abstract class Rouman5 : KeiSource() {
         val url = chapter.url
 
         return when {
-            url.startsWith(
-                "http://",
-            ) -> url
+            url.startsWith("http://") ->
+                url
 
-            url.startsWith(
-                "https://",
-            ) -> url
+            url.startsWith("https://") ->
+                url
 
-            url.startsWith("/") -> {
+            url.startsWith("/") ->
                 "$baseUrl$url"
-            }
 
-            else -> {
+            else ->
                 "$baseUrl/$url"
-            }
         }
     }
 
@@ -487,115 +447,117 @@ abstract class Rouman5 : KeiSource() {
         url: String,
     ): MangasPage {
 
-        val doc = client
-            .get(url)
-            .asJsoup()
+        val document =
+            fetchDocument(url)
+                ?: return MangasPage(
+                    emptyList(),
+                    false,
+                )
 
         val mangas =
-            doc.select(
-                "a[href^=/books/]",
-            )
-            .mapNotNull { anchor ->
+            document
+                .select("a[href^=/books/]")
+                .mapNotNull { anchor ->
 
-                val path =
-                    anchor.attr(
-                        "href",
-                    )
-                    .removePrefix(
-                        "/books/",
-                    )
-                    .trim('/')
+                    val href =
+                        anchor.absUrl("href")
 
-                // 列表页面只接受：
-                // /books/{mangaId}
-                //
-                // 章节页面：
-                // /books/{mangaId}/{chapterId}
-                //
-                // 直接排除。
-                if (
-                    path.isBlank() ||
-                    path.contains('/')
-                ) {
-                    return@mapNotNull null
-                }
+                    if (
+                        href.isBlank()
+                    ) {
+                        return@mapNotNull null
+                    }
 
-                val title =
-                    anchor
-                        .select(
-                            "h3,h4,span",
-                        )
-                        .firstOrNull()
-                        ?.text()
-                        ?.trim()
-                        ?.takeIf {
-                            it.isNotBlank()
-                        }
-                        ?: anchor
-                            .text()
-                            .trim()
+                    val path =
+                        href
+                            .substringAfter(
+                                "/books/",
+                                "",
+                            )
+                            .trim('/')
 
-                if (title.isBlank()) {
-                    return@mapNotNull null
-                }
+                    // Exclude chapter URLs.
+                    if (
+                        path.isBlank() ||
+                            path.contains("/")
+                    ) {
+                        return@mapNotNull null
+                    }
 
-                val image =
-                    anchor
-                        .select(
-                            "img",
-                        )
-                        .firstOrNull()
-                        ?.let { img ->
+                    val title =
+                        anchor
+                            .select(
+                                "h3, h4, span",
+                            )
+                            .firstOrNull()
+                            ?.text()
+                            ?.takeIf {
+                                it.isNotEmpty()
+                            }
+                            ?: anchor.text()
 
-                            img.absUrl(
-                                "data-src",
-                            ).ifBlank {
+                    if (
+                        title.isBlank()
+                    ) {
+                        return@mapNotNull null
+                    }
 
-                                img.absUrl(
-                                    "data-original",
+                    val image =
+                        anchor
+                            .select("img")
+                            .firstOrNull()
+                            ?.let { image ->
+
+                                image.absUrl(
+                                    "src",
                                 ).ifBlank {
 
-                                    img.absUrl(
-                                        "src",
-                                    )
+                                    image.absUrl(
+                                        "data-src",
+                                    ).ifBlank {
+
+                                        image.absUrl(
+                                            "data-original",
+                                        )
+                                    }
                                 }
                             }
-                        }
-                        .orEmpty()
+                            .orEmpty()
 
-                SManga.create().apply {
+                    SManga.create().apply {
 
-                    // 只保存 ID
-                    url = path
+                        setUrlWithoutDomain(
+                            href,
+                        )
 
-                    this.title = title
+                        this.title =
+                            cleanMangaTitle(
+                                title,
+                            )
 
-                    thumbnail_url = image
+                        thumbnail_url =
+                            image
+                    }
                 }
-            }
-            .distinctBy {
-                it.url
-            }
+                .distinctBy {
+                    it.url
+                }
 
         val hasNext =
-            doc.select(
-                "a",
-            ).any {
+            document
+                .select("a")
+                .any { link ->
 
-                val text =
-                    it.text().trim()
+                    val text =
+                        link.text()
 
-                text.contains(
-                    "下一頁",
-                ) ||
-                    text.contains(
-                        "下一页",
-                    ) ||
-                    text.contains(
-                        "Next",
-                        ignoreCase = true,
-                    )
-            }
+                    text.contains("下一頁") ||
+                        text.contains("下一页") ||
+                        text.contains(
+                            "Next",
+                            ignoreCase = true,
+                        )
+                }
 
         return MangasPage(
             mangas,
@@ -608,60 +570,46 @@ abstract class Rouman5 : KeiSource() {
     // ============================================================
 
     private fun parseManga(
-        doc: Document,
+        document: Document,
         id: String,
     ): SManga {
 
-        val manga = SManga.create()
+        val manga =
+            SManga.create()
 
-        manga.url = id
-
-        // --------------------------------------------------------
-        // 标题解析
-        //
-        // 优先级：
-        //
-        // 1. h1
-        // 2. og:title
-        // 3. twitter:title
-        // 4. title
-        // --------------------------------------------------------
-
-        val titleCandidates =
-            listOf(
-                doc.select(
-                    "h1",
-                ).firstOrNull()?.text(),
-
-                doc.select(
-                    "meta[property=og:title]",
-                )
-                    .firstOrNull()
-                    ?.attr(
-                        "content",
-                    ),
-
-                doc.select(
-                    "meta[name=twitter:title]",
-                )
-                    .firstOrNull()
-                    ?.attr(
-                        "content",
-                    ),
-
-                doc.title(),
-            )
+        manga.setUrlWithoutDomain(
+            "$baseUrl/books/$id",
+        )
 
         val title =
-            titleCandidates
+            listOf(
+                document
+                    .select("h1")
+                    .firstOrNull()
+                    ?.text(),
+
+                document
+                    .select(
+                        "meta[property=og:title]",
+                    )
+                    .firstOrNull()
+                    ?.attr("content"),
+
+                document
+                    .select(
+                        "meta[name=twitter:title]",
+                    )
+                    .firstOrNull()
+                    ?.attr("content"),
+
+                document.title(),
+            )
                 .asSequence()
                 .map {
-                    it.orEmpty().trim()
+                    it.orEmpty()
                 }
                 .map {
-                    cleanMangaTitle(
-                        it,
-                    )
+                    cleanMangaTitle(it)
                 }
                 .firstOrNull {
                     it.isNotBlank() &&
@@ -680,51 +628,40 @@ abstract class Rouman5 : KeiSource() {
 
         manga.title = title
 
-        // --------------------------------------------------------
-        // Cover
-        // --------------------------------------------------------
-
         manga.thumbnail_url =
-            doc.select(
-                "meta[property=og:image]",
-            )
+            document
+                .select(
+                    "meta[property=og:image]",
+                )
                 .firstOrNull()
-                ?.attr(
-                    "content",
-                )
-                ?.takeIf {
-                    it.isNotBlank()
-                }
-                ?: doc.select(
-                    "img",
-                )
-                    .firstOrNull()
-                    ?.let {
+                ?.attr("content")
+                .orEmpty()
+                .ifBlank {
 
-                        it.absUrl(
-                            "src",
-                        ).ifBlank {
+                    document
+                        .select("img")
+                        .firstOrNull()
+                        ?.let { image ->
 
-                            it.absUrl(
-                                "data-src",
+                            image.absUrl(
+                                "src",
                             ).ifBlank {
 
-                                it.absUrl(
-                                    "data-original",
-                                )
+                                image.absUrl(
+                                    "data-src",
+                                ).ifBlank {
+
+                                    image.absUrl(
+                                        "data-original",
+                                    )
+                                }
                             }
                         }
-                    }
-                    .orEmpty()
-
-        // --------------------------------------------------------
-        // Info
-        // --------------------------------------------------------
+                        .orEmpty()
+                }
 
         val bodyText =
-            doc.body()
-                ?.text()
-                .orEmpty()
+            document.body()?.text().orEmpty()
 
         manga.author =
             extractInfo(
@@ -739,27 +676,18 @@ abstract class Rouman5 : KeiSource() {
             )
 
         manga.description =
-            extractDescription(
-                doc,
-            )
+            extractDescription(document)
 
         val status =
             extractInfo(
                 bodyText,
                 "狀態",
             )
-                .lowercase(
-                    Locale.ROOT,
-                )
 
         manga.status =
             if (
-                status.contains(
-                    "完結",
-                ) ||
-                    status.contains(
-                        "完结",
-                    )
+                status.contains("完結") ||
+                    status.contains("完结")
             ) {
                 SManga.COMPLETED
             } else {
@@ -774,29 +702,26 @@ abstract class Rouman5 : KeiSource() {
     // ============================================================
 
     private fun parseChapters(
-        doc: Document,
+        document: Document,
         id: String,
     ): List<SChapter> {
 
-        val selector =
-            "a[href^=/books/$id/]"
-
-        return doc
+        return document
             .select(
-                selector,
+                "a[href*=\"/books/$id/\"]",
             )
             .mapNotNull { link ->
 
                 val href =
-                    link.absUrl(
-                        "href",
-                    )
+                    link.absUrl("href")
 
-                if (href.isBlank()) {
+                if (
+                    href.isBlank()
+                ) {
                     return@mapNotNull null
                 }
 
-                val chapterPath =
+                val chapterId =
                     href
                         .substringAfter(
                             "/books/$id/",
@@ -805,16 +730,18 @@ abstract class Rouman5 : KeiSource() {
                         .trim('/')
 
                 if (
-                    chapterPath.isBlank() ||
-                    chapterPath.contains('/')
+                    chapterId.isBlank() ||
+                        chapterId.contains("/")
                 ) {
                     return@mapNotNull null
                 }
 
                 val name =
-                    link.text().trim()
+                    link.text()
 
-                if (name.isBlank()) {
+                if (
+                    name.isBlank()
+                ) {
                     return@mapNotNull null
                 }
 
@@ -834,6 +761,28 @@ abstract class Rouman5 : KeiSource() {
     }
 
     // ============================================================
+    // HTTP document
+    // ============================================================
+
+    private suspend fun fetchDocument(
+        url: String,
+    ): Document? {
+
+        return runCatching {
+
+            client
+                .get(url)
+                .use { response ->
+
+                    Jsoup.parse(
+                        response.body.string(),
+                        url,
+                    )
+                }
+        }.getOrNull()
+    }
+
+    // ============================================================
     // WebView document
     // ============================================================
 
@@ -843,27 +792,26 @@ abstract class Rouman5 : KeiSource() {
     ): Document? {
 
         val html =
-            withTimeoutOrNull(
-                30_000L,
-            ) {
+            runCatching {
 
-                runWebView<String> {
+                runWebView<String>(
+                    timeout = 30.seconds,
+                ) {
 
                     javaScriptEnabled = true
                     domStorageEnabled = true
 
-                    loadUrl(
-                        url,
-                    )
+                    loadUrl(url)
 
                     onPageFinished {
 
-                        poll(500) {
+                        poll(
+                            500.milliseconds,
+                        ) {
 
                             evaluateJs(
                                 """
                                 (() => {
-
                                     const buttons =
                                         Array.from(
                                             document.querySelectorAll(
@@ -874,14 +822,12 @@ abstract class Rouman5 : KeiSource() {
                                     const gate =
                                         buttons.find(
                                             el => {
-
                                                 const text =
                                                     (
                                                         el.innerText ||
                                                         el.textContent ||
                                                         ""
-                                                    )
-                                                    .trim();
+                                                    ).trim();
 
                                                 return (
                                                     text.includes("我已滿18歲") ||
@@ -900,21 +846,20 @@ abstract class Rouman5 : KeiSource() {
                                         return "";
                                     }
 
-                                    const hasTitle =
-                                        !!document.querySelector(
-                                            "h1"
-                                        );
+                                    const title =
+                                        document.querySelector("h1");
 
-                                    const hasChapter =
-                                        !!document.querySelector(
+                                    const chapters =
+                                        document.querySelector(
                                             'a[href*="/books/"]'
                                         );
 
                                     if (
-                                        hasTitle &&
+                                        title &&
+                                        title.textContent.trim() &&
                                         (
                                             !${requireChapters} ||
-                                            hasChapter
+                                            chapters
                                         )
                                     ) {
                                         return document
@@ -930,15 +875,13 @@ abstract class Rouman5 : KeiSource() {
                                 if (
                                     value.isNotBlank()
                                 ) {
-                                    resolve(
-                                        value,
-                                    )
+                                    resolve(value)
                                 }
                             }
                         }
                     }
                 }
-            }
+            }.getOrNull()
 
         if (
             html.isNullOrBlank()
@@ -946,21 +889,16 @@ abstract class Rouman5 : KeiSource() {
             return null
         }
 
-        val decoded =
-            decodeJsString(
-                html,
-            )
-
         return runCatching {
             Jsoup.parse(
-                decoded,
-                baseUrl,
+                html,
+                url,
             )
         }.getOrNull()
     }
 
     // ============================================================
-    // Manga ID
+    // ID
     // ============================================================
 
     private fun extractMangaId(
@@ -971,19 +909,6 @@ abstract class Rouman5 : KeiSource() {
             .substringAfter(
                 "/books/",
                 value,
-            )
-            .trim('/')
-            .substringBefore('/')
-            .trim()
-    }
-
-    private fun extractMangaIdFromPath(
-        path: String,
-    ): String {
-
-        return path
-            .removePrefix(
-                "/books/",
             )
             .trim('/')
             .substringBefore('/')
@@ -1005,17 +930,11 @@ abstract class Rouman5 : KeiSource() {
                 ),
                 "",
             )
-            .replace(
-                Regex(
-                    """\s*-\s*肉漫屋.*$""",
-                ),
-                "",
-            )
             .trim()
     }
 
     // ============================================================
-    // Extract info
+    // Info
     // ============================================================
 
     private fun extractInfo(
@@ -1032,7 +951,6 @@ abstract class Rouman5 : KeiSource() {
             .find(text)
             ?.groupValues
             ?.getOrNull(1)
-            ?.trim()
             .orEmpty()
     }
 
@@ -1041,11 +959,11 @@ abstract class Rouman5 : KeiSource() {
     // ============================================================
 
     private fun extractDescription(
-        doc: Document,
+        document: Document,
     ): String {
 
         val text =
-            doc.body()
+            document.body()
                 ?.text()
                 .orEmpty()
 
@@ -1057,87 +975,24 @@ abstract class Rouman5 : KeiSource() {
                 "敘述：",
             )
 
-        return markers
-            .firstNotNullOfOrNull { marker ->
+        for (marker in markers) {
 
-                val index =
-                    text.indexOf(
-                        marker,
+            val index =
+                text.indexOf(marker)
+
+            if (index >= 0) {
+
+                return text
+                    .substring(
+                        index + marker.length,
                     )
-
-                if (index < 0) {
-                    null
-                } else {
-                    text
-                        .substring(
-                            index + marker.length,
-                        )
-                        .substringBefore(
-                            "放入書架",
-                        )
-                        .trim()
-                }
+                    .substringBefore(
+                        "放入書架",
+                    )
+                    .trim()
             }
-            .orEmpty()
-    }
-
-    // ============================================================
-    // WebView JS result decoder
-    // ============================================================
-
-    private fun decodeJsString(
-        value: String,
-    ): String {
-
-        var result =
-            value.trim()
-
-        if (
-            result.startsWith("\"") &&
-            result.endsWith("\"")
-        ) {
-            result =
-                result.substring(
-                    1,
-                    result.length - 1,
-                )
         }
 
-        return result
-            .replace(
-                "\\n",
-                "\n",
-            )
-            .replace(
-                "\\r",
-                "\r",
-            )
-            .replace(
-                "\\t",
-                "\t",
-            )
-            .replace(
-                "\\\"",
-                "\"",
-            )
-            .replace(
-                "\\/",
-                "/",
-            )
-            .replace(
-                "\\u003C",
-                "<",
-                ignoreCase = true,
-            )
-            .replace(
-                "\\u003E",
-                ">",
-                ignoreCase = true,
-            )
-            .replace(
-                "\\u0026",
-                "&",
-                ignoreCase = true,
-            )
+        return ""
     }
 }
