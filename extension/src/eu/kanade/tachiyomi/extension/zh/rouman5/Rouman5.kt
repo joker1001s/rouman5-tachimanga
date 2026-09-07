@@ -112,6 +112,46 @@ abstract class Rouman5 : KeiSource() {
     }
 
     // =========================================================================
+    // 热门
+    // =========================================================================
+    
+    override suspend fun getPopularManga(
+        page: Int,
+    ): MangasPage {
+    
+        val url = baseUrl
+    
+        val body = client.get(url).use { response ->
+            if (!response.isSuccessful) {
+                throw IllegalStateException(
+                    "Failed to load popular manga: HTTP ${response.code}",
+                )
+            }
+    
+            response.body.string()
+        }
+    
+        val document = Jsoup.parse(
+            body,
+            url,
+        )
+    
+        val mangas = document
+            .select("a[href*=\"/books/\"]")
+            .mapNotNull {
+                parseSearchManga(it)
+            }
+            .distinctBy {
+                it.url
+            }
+    
+        return MangasPage(
+            mangas,
+            false,
+        )
+    }
+    
+    // =========================================================================
     // 最新
     // =========================================================================
 
