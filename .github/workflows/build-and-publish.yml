@@ -2,6 +2,7 @@ name: Build Rouman5
 
 on:
   workflow_dispatch:
+
   push:
     branches:
       - main
@@ -18,44 +19,79 @@ jobs:
     timeout-minutes: 40
 
     steps:
+      # ============================================================
+      # 1. Checkout
+      # ============================================================
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ============================================================
+      # 2. Java 17
+      # ============================================================
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
+      # ============================================================
+      # 3. Clone latest Keiyoushi build environment
+      # ============================================================
       - name: Clone current Keiyoushi build environment
         run: |
-          git clone --depth 1 https://github.com/keiyoushi/extensions-source.git upstream
+          set -euo pipefail
 
+          git clone --depth 1 \
+            https://github.com/keiyoushi/extensions-source.git \
+            upstream
+
+      # ============================================================
+      # 4. Inject Rouman5 source
+      # ============================================================
       - name: Inject Rouman5
         run: |
+          set -euo pipefail
+
           rm -rf upstream/src/zh/rouman5
           mkdir -p upstream/src/zh/rouman5
+
           cp -a extension/. upstream/src/zh/rouman5/
 
-      # 自动修复 Kotlin / Gradle / XML 格式
+      # ============================================================
+      # 5. Format source
+      # ============================================================
       - name: Format source
         working-directory: upstream
         run: |
+          set -euo pipefail
+
           ./gradlew spotlessApply --no-daemon
 
-      # 构建 APK
+      # ============================================================
+      # 6. Build debug APK
+      # ============================================================
       - name: Build debug APK
         working-directory: upstream
         run: |
-          ./gradlew :src:zh:rouman5:assembleDebug --no-daemon
+          set -euo pipefail
 
-      # 获取版本号
+          ./gradlew \
+            :src:zh:rouman5:assembleDebug \
+            --no-daemon
+
+      # ============================================================
+      # 7. Read extension version
+      # ============================================================
       - name: Read version
         id: version
         run: |
           set -euo pipefail
 
-          VERSION_CODE="$(grep -E '^    versionCode = ' extension/build.gradle.kts | sed -E 's/.*= ([0-9]+).*/\1/')"
+          VERSION_CODE="$(
+            grep -E '^    versionCode = ' \
+              extension/build.gradle.kts \
+              | sed -E 's/.*= ([0-9]+).*/\1/'
+          )"
 
           if [ -z "$VERSION_CODE" ]; then
             echo "::error::Unable to read versionCode."
@@ -69,20 +105,29 @@ jobs:
           echo "VERSION_NAME=$VERSION_NAME" >> "$GITHUB_OUTPUT"
           echo "APK_NAME=$APK_NAME" >> "$GITHUB_OUTPUT"
 
-          echo "Version code: $VERSION_CODE"
-          echo "Version name: $VERSION_NAME"
-          echo "APK name: $APK_NAME"
+          echo "========================================"
+          echo "Version code : $VERSION_CODE"
+          echo "Version name : $VERSION_NAME"
+          echo "APK name     : $APK_NAME"
+          echo "========================================"
 
-      # 准备 Android 签名工具
+      # ============================================================
+      # 8. Prepare Android build tools
+      # ============================================================
       - name: Prepare Android signing tool
         run: |
+          set -euo pipefail
+
           SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
 
-          yes | "$SDKMANAGER" "build-tools;35.0.0" >/dev/null 2>&1 || true
+          yes | "$SDKMANAGER" "build-tools;35.0.0" \
+            >/dev/null 2>&1 || true
 
           echo "$ANDROID_HOME/build-tools/35.0.0" >> "$GITHUB_PATH"
 
-      # 解码签名密钥
+      # ============================================================
+      # 9. Decode private signing keystore
+      # ============================================================
       - name: Decode signing key
         env:
           KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -101,7 +146,11 @@ jobs:
             exit 1
           fi
 
-      # 对 APK 进行签名
+          echo "Keystore decoded successfully."
+
+      # ============================================================
+      # 10. Sign APK
+      # ============================================================
       - name: Sign APK
         env:
           KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
@@ -111,120 +160,503 @@ jobs:
         run: |
           set -euo pipefail
 
-          APK="$(find upstream/src/zh/rouman5/build/outputs/apk/debug \
-            -type f \
-            -name '*.apk' \
-            | head -n 1)"
+          APK="$(
+            find upstream/src/zh/rouman5/build/outputs/apk/debug \
+              -type f \
+              -name '*.apk' \
+              | head -n 1
+          )"
 
           if [ -z "$APK" ]; then
             echo "::error::APK not found."
             exit 1
           fi
 
-          echo "Found APK: $APK"
+          echo "Found APK:"
+          echo "$APK"
 
-          mkdir -p publish
+          mkdir -p publish/apk
 
-          cp "$APK" "publish/$APK_NAME"
+          cp "$APK" "publish/apk/$APK_NAME"
+
+          echo "Running zipalign..."
 
           zipalign -p -f 4 \
-            "publish/$APK_NAME" \
-            "publish/aligned.apk"
+            "publish/apk/$APK_NAME" \
+            "publish/apk/aligned.apk"
 
-          mv "publish/aligned.apk" "publish/$APK_NAME"
+          mv \
+            "publish/apk/aligned.apk" \
+            "publish/apk/$APK_NAME"
+
+          echo "Running apksigner..."
 
           apksigner sign \
             --ks rouman5-release.jks \
             --ks-pass "pass:$KEYSTORE_PASSWORD" \
             --ks-key-alias "$KEY_ALIAS" \
             --key-pass "pass:$KEY_PASSWORD" \
-            "publish/$APK_NAME"
+            "publish/apk/$APK_NAME"
 
-          apksigner verify --verbose "publish/$APK_NAME"
+          echo "Verifying APK..."
 
-          echo "APK signed successfully:"
-          ls -lh "publish/$APK_NAME"
+          apksigner verify \
+            --verbose \
+            "publish/apk/$APK_NAME"
 
-      # 生成 Tachimanga 仓库索引
-      - name: Generate index
+          echo "APK signed successfully."
+
+          ls -lh "publish/apk/$APK_NAME"
+
+      # ============================================================
+      # 11. Verify signing certificate fingerprint
+      # ============================================================
+      - name: Verify signing fingerprint
+        env:
+          EXPECTED_FINGERPRINT: "845011207DA014E2F7B7F846800E9D5F9B8A997EEE7E120CE82F46B383267794"
+        run: |
+          set -euo pipefail
+
+          APK="${{ steps.version.outputs.APK_NAME }}"
+
+          ACTUAL_FINGERPRINT="$(
+            apksigner verify \
+              --print-certs \
+              "publish/apk/$APK" \
+              2>/dev/null \
+              | grep "Signer #1 certificate SHA-256 digest:" \
+              | sed 's/.*: //' \
+              | tr -d ':'
+          )"
+
+          ACTUAL_FINGERPRINT="$(echo "$ACTUAL_FINGERPRINT" | tr '[:lower:]' '[:upper:]')"
+          EXPECTED_FINGERPRINT="$(echo "$EXPECTED_FINGERPRINT" | tr '[:lower:]' '[:upper:]')"
+
+          echo "Expected fingerprint:"
+          echo "$EXPECTED_FINGERPRINT"
+
+          echo "Actual fingerprint:"
+          echo "$ACTUAL_FINGERPRINT"
+
+          if [ "$ACTUAL_FINGERPRINT" != "$EXPECTED_FINGERPRINT" ]; then
+            echo "::error::APK signing fingerprint does not match the repository fingerprint."
+            exit 1
+          fi
+
+          echo "Signing fingerprint verified successfully."
+
+      # ============================================================
+      # 12. Generate standard repository metadata
+      # ============================================================
+      - name: Generate repository metadata
         env:
           VERSION_CODE: ${{ steps.version.outputs.VERSION_CODE }}
           VERSION_NAME: ${{ steps.version.outputs.VERSION_NAME }}
           APK_NAME: ${{ steps.version.outputs.APK_NAME }}
+
         run: |
           set -euo pipefail
 
-          cat > publish/index.min.json <<EOF
-          [
-            {
-              "name": "Tachiyomi: 肉漫屋",
-              "pkg": "eu.kanade.tachiyomi.extension.zh.rouman5",
-              "apk": "$APK_NAME",
-              "lang": "zh",
-              "code": $VERSION_CODE,
-              "version": "$VERSION_NAME",
-              "nsfw": 1,
-              "hasReadme": 0,
-              "hasChangelog": 0,
-              "sources": [
-                {
-                  "name": "肉漫屋",
-                  "lang": "zh",
-                  "id": "6000000000000099",
-                  "baseUrl": "https://rouman5.com",
-                  "versionId": 1
-                }
-              ]
-            }
+          mkdir -p publish
+
+          cat > generate_repo.py <<'PY'
+          import gzip
+          import json
+          import os
+          import urllib.request
+          from pathlib import Path
+
+          # ------------------------------------------------------------
+          # Configuration
+          # ------------------------------------------------------------
+
+          OWNER = "joker1001s"
+          REPO = "rouman5-tachimanga"
+          BRANCH = "repo"
+
+          PACKAGE = "eu.kanade.tachiyomi.extension.zh.rouman5"
+
+          EXTENSION_NAME = "肉漫屋"
+          LANGUAGE = "zh"
+
+          SOURCE_ID = 6000000000000099
+          BASE_URL = "https://rouman5.com"
+
+          VERSION_CODE = int(os.environ["VERSION_CODE"])
+          VERSION_NAME = os.environ["VERSION_NAME"]
+          APK_NAME = os.environ["APK_NAME"]
+
+          SIGNING_FINGERPRINT = (
+              "845011207DA014E2F7B7F846800E9D5F"
+              "9B8A997EEE7E120CE82F46B383267794"
+          ).lower()
+
+          APK_URL = (
+              f"https://raw.githubusercontent.com/"
+              f"{OWNER}/{REPO}/{BRANCH}/apk/{APK_NAME}"
+          )
+
+          REPO_URL = (
+              f"https://raw.githubusercontent.com/"
+              f"{OWNER}/{REPO}/{BRANCH}"
+          )
+
+          # ------------------------------------------------------------
+          # Download current protobuf schema
+          # ------------------------------------------------------------
+
+          index_pb2_url = (
+              "https://raw.githubusercontent.com/"
+              "keiyoushi/extensions-source/main/"
+              ".github/scripts/index_pb2.py"
+          )
+
+          urllib.request.urlretrieve(
+              index_pb2_url,
+              "index_pb2.py",
+          )
+
+          # ------------------------------------------------------------
+          # Import protobuf schema
+          # ------------------------------------------------------------
+
+          import sys
+
+          sys.path.insert(0, str(Path.cwd()))
+
+          import index_pb2
+
+          from google.protobuf import json_format
+
+          # ------------------------------------------------------------
+          # Build protobuf source
+          # ------------------------------------------------------------
+
+          source = index_pb2.Source(
+              id=SOURCE_ID,
+              name=EXTENSION_NAME,
+              language=LANGUAGE,
+              homeUrl=BASE_URL,
+          )
+
+          resources = index_pb2.Resources(
+              apkUrl=APK_URL,
+          )
+
+          extension = index_pb2.Extension(
+              name=EXTENSION_NAME,
+              packageName=PACKAGE,
+              resources=resources,
+              extensionLib="1.6",
+              versionCode=VERSION_CODE,
+              versionName=VERSION_NAME,
+              contentWarning=3,
+              sources=[source],
+          )
+
+          index = index_pb2.Index(
+              name="Rouman5",
+              badgeLabel="ROU",
+              signingKey=SIGNING_FINGERPRINT,
+              contact=index_pb2.Contact(
+                  website=f"https://github.com/{OWNER}/{REPO}",
+              ),
+              extensionList=index_pb2.ExtensionList(
+                  extensions=[extension],
+              ),
+          )
+
+          # ------------------------------------------------------------
+          # index.json
+          # ------------------------------------------------------------
+
+          Path("publish/index.json").write_text(
+              json_format.MessageToJson(
+                  index,
+                  always_print_fields_with_no_presence=False,
+                  preserving_proto_field_name=True,
+              ),
+              encoding="utf-8",
+          )
+
+          # ------------------------------------------------------------
+          # index.pb
+          #
+          # Same gzip-compressed protobuf format used by the current
+          # Keiyoushi repository.
+          # ------------------------------------------------------------
+
+          with open("publish/index.pb", "wb") as f:
+              f.write(
+                  gzip.compress(
+                      index.SerializeToString(
+                          deterministic=True
+                      ),
+                      mtime=0,
+                  )
+              )
+
+          # ------------------------------------------------------------
+          # index.min.json
+          #
+          # Legacy Tachiyomi/Tachimanga repository format.
+          # ------------------------------------------------------------
+
+          legacy = [
+              {
+                  "name": f"Tachiyomi: {EXTENSION_NAME}",
+                  "pkg": PACKAGE,
+                  "apk": APK_NAME,
+                  "lang": LANGUAGE,
+                  "code": VERSION_CODE,
+                  "version": VERSION_NAME,
+                  "nsfw": 1,
+                  "hasReadme": 0,
+                  "hasChangelog": 0,
+                  "sources": [
+                      {
+                          "name": EXTENSION_NAME,
+                          "lang": LANGUAGE,
+                          "id": str(SOURCE_ID),
+                          "baseUrl": BASE_URL,
+                      }
+                  ],
+              }
           ]
-          EOF
 
-          python -m json.tool publish/index.min.json >/dev/null
+          Path("publish/index.min.json").write_text(
+              json.dumps(
+                  legacy,
+                  ensure_ascii=False,
+                  separators=(",", ":"),
+              ),
+              encoding="utf-8",
+          )
 
-          echo "Generated index.min.json:"
+          # ------------------------------------------------------------
+          # repo.json
+          #
+          # This is the important file that was missing before.
+          # Tachimanga/Mihon uses signingKeyFingerprint to trust
+          # extensions from this repository.
+          # ------------------------------------------------------------
+
+          repo_json = {
+              "index_v2": f"{REPO_URL}/index.pb",
+              "meta": {
+                  "name": "Rouman5",
+                  "shortName": "Rouman5",
+                  "website": f"https://github.com/{OWNER}/{REPO}",
+                  "signingKeyFingerprint": SIGNING_FINGERPRINT,
+              },
+          }
+
+          Path("publish/repo.json").write_text(
+              json.dumps(
+                  repo_json,
+                  ensure_ascii=False,
+                  indent=2,
+              ) + "\n",
+              encoding="utf-8",
+          )
+
+          # ------------------------------------------------------------
+          # index.html
+          # ------------------------------------------------------------
+
+          html = f"""<!DOCTYPE html>
+          <html>
+          <head>
+          <meta charset="UTF-8">
+          <title>Rouman5 Extension Repository</title>
+          </head>
+          <body>
+          <h1>Rouman5 Extension Repository</h1>
+          <p>
+          <a href="{APK_URL}">
+          Tachiyomi: {EXTENSION_NAME}
+          </a>
+          </p>
+          </body>
+          </html>
+          """
+
+          Path("publish/index.html").write_text(
+              html,
+              encoding="utf-8",
+          )
+
+          # ------------------------------------------------------------
+          # Validate JSON
+          # ------------------------------------------------------------
+
+          json.loads(
+              Path("publish/index.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+
+          json.loads(
+              Path("publish/index.min.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+
+          json.loads(
+              Path("publish/repo.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+
+          print("========================================")
+          print("Repository generated successfully.")
+          print("========================================")
+          print("APK:")
+          print(APK_URL)
+          print("")
+          print("Index:")
+          print(f"{REPO_URL}/index.pb")
+          print("")
+          print("Fingerprint:")
+          print(SIGNING_FINGERPRINT)
+          print("========================================")
+          PY
+
+          python -m pip install --upgrade "protobuf==7.35.1"
+
+          python generate_repo.py
+
+          echo ""
+          echo "Generated files:"
+          find publish -maxdepth 2 -type f -print
+
+          echo ""
+          echo "repo.json:"
+          cat publish/repo.json
+
+          echo ""
+          echo "index.min.json:"
           cat publish/index.min.json
 
-      # 发布到 repo 分支
+      # ============================================================
+      # 13. Verify generated repository
+      # ============================================================
+      - name: Verify repository
+        run: |
+          set -euo pipefail
+
+          test -f publish/repo.json
+          test -f publish/index.pb
+          test -f publish/index.json
+          test -f publish/index.min.json
+          test -f "publish/apk/${{ steps.version.outputs.APK_NAME }}"
+
+          echo "Repository files verified."
+
+          echo ""
+          echo "Repository:"
+          ls -lh publish/
+
+          echo ""
+          echo "APK:"
+          ls -lh publish/apk/
+
+      # ============================================================
+      # 14. Publish repo branch
+      # ============================================================
       - name: Publish repo branch
         run: |
           set -euo pipefail
 
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
 
           git fetch origin repo || true
 
           rm -rf .repo-work
 
           if git show-ref --verify --quiet refs/remotes/origin/repo; then
-            git worktree add --detach .repo-work origin/repo
+
+            echo "Existing repo branch found."
+
+            git worktree add \
+              --detach \
+              .repo-work \
+              origin/repo
+
             cd .repo-work
+
             git checkout -B repo
 
-            find . \
-              -mindepth 1 \
-              -maxdepth 1 \
-              ! -name .git \
-              -exec rm -rf {} +
           else
-            git worktree add --detach .repo-work
+
+            echo "Creating repo branch."
+
+            git worktree add \
+              --detach \
+              .repo-work
+
             cd .repo-work
 
             git checkout --orphan repo
+
             git rm -rf . 2>/dev/null || true
+
           fi
 
-          cp ../publish/*.apk .
+          # ----------------------------------------------------------
+          # Clean old repository files
+          # ----------------------------------------------------------
+
+          find . \
+            -mindepth 1 \
+            -maxdepth 1 \
+            ! -name ".git" \
+            -exec rm -rf {} +
+
+          # ----------------------------------------------------------
+          # Copy new repository
+          # ----------------------------------------------------------
+
+          mkdir -p apk
+
+          cp ../publish/apk/*.apk apk/
+
+          cp ../publish/repo.json .
+          cp ../publish/index.pb .
+          cp ../publish/index.json .
           cp ../publish/index.min.json .
+          cp ../publish/index.html .
+
+          # ----------------------------------------------------------
+          # Show final structure
+          # ----------------------------------------------------------
+
+          echo ""
+          echo "Final repo branch:"
+          find . -maxdepth 2 -type f | sort
+
+          # ----------------------------------------------------------
+          # Commit
+          # ----------------------------------------------------------
 
           git add .
 
-          git commit -m "Update Rouman5 extension" || true
+          git commit \
+            -m "Update Rouman5 extension" \
+            || true
 
           git push origin HEAD:repo --force
 
-      # 清理签名文件
+          echo ""
+          echo "Repo branch published successfully."
+
+      # ============================================================
+      # 15. Cleanup
+      # ============================================================
       - name: Cleanup
         if: always()
         run: |
           rm -f rouman5-release.jks
+          rm -f generate_repo.py
