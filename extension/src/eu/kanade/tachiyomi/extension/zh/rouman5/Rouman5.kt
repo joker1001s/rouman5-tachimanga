@@ -1,7 +1,6 @@
-```kotlin
 package eu.kanade.tachiyomi.extension.zh.rouman5
 
-import eu.kanade.tachiyomi.source.model.Filter
+import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
@@ -9,45 +8,179 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
-import keiyoushi.network.get
 import keiyoushi.source.KeiSource
-import keiyoushi.utils.runWebView
-import kotlinx.coroutines.withTimeoutOrNull
+import keiyoushi.network.get
 import okhttp3.HttpUrl
+import okhttp3.Request
+import okhttp3.Response
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
 import java.net.URLEncoder
-import kotlin.time.Duration.Companion.milliseconds
-import kotlin.time.Duration.Companion.seconds
+import java.nio.charset.StandardCharsets
 
 @Source
 abstract class Rouman5 : KeiSource() {
 
     override val supportsLatest = true
 
-    // ============================================================
-    // Popular
-    // ============================================================
+    // ========================================================================
+    // 热门漫画
+    // ========================================================================
 
-    override suspend fun getPopularManga(page: Int): MangasPage {
-        return getMangaList(
-            "$baseUrl/books?continued=&page=${page - 1}",
+    override suspend fun getPopularManga(
+        page: Int,
+    ): MangasPage {
+
+        val url = "$baseUrl/home"
+
+        val response = client.get(url)
+
+        val document = Jsoup.parse(
+            response.body.string(),
+            url,
+        )
+
+        return parseHomePage(
+            document,
+            Regex("正熱門|今日最佳|本週熱門"),
         )
     }
 
-    // ============================================================
-    // Latest
-    // ============================================================
+    private fun parseHomePage(
+        document: Document,
+        sectionRegex: Regex,
+    ): MangasPage {
 
-    override suspend fun getLatestUpdates(page: Int): MangasPage {
-        return getMangaList(
-            "$baseUrl/books?continued=&page=${page - 1}",
+        val entries = mutableListOf<SManga>()
+
+        /*
+         * 肉漫屋首页结构：
+         *
+         * div.px-1
+         *   ├── section
+         *   ├── section
+         *   ├── section
+         *
+         * 根据 section 标题判断热门分类。
+         */
+
+        val container =
+            document.selectFirst("div.px-1")
+
+        if (container != null) {
+
+            for (section in container.children()) {
+
+                val text = section.text()
+
+                if (!sectionRegex.containsMatchIn(text)) {
+                    continue
+                }
+
+                entries += parseEntries(section)
+            }
+        }
+
+        return MangasPage(
+            entries.distinctBy { it.url },
+            false,
         )
     }
 
-    // ============================================================
-    // Search + Filters
-    // ============================================================
+    // ========================================================================
+    // 最新更新
+    // ========================================================================
+
+    override suspend fun getLatestUpdates(
+        page: Int,
+    ): MangasPage {
+
+        val url = "$baseUrl/home"
+
+        val response = client.get(url)
+
+        val document = Jsoup.parse(
+            response.body.string(),
+            url,
+        )
+
+        return parseHomePage(
+            document,
+            Regex("最近更新"),
+        )
+    }
+
+    // ========================================================================
+    // 首页漫画解析
+    // ========================================================================
+
+    private fun parseEntries(
+        container: Element,
+    ): List<SManga> {
+
+        return container
+            .select("a[href*=\"/books/\"]")
+            .mapNotNull { element ->
+
+                val href =
+                    element.absUrl("href")
+
+                if (
+                    href.isBlank() ||
+                    !href.contains("/books/")
+                ) {
+                    return@mapNotNull null
+                }
+
+                val title =
+                    firstNonBlank(
+                        element.selectFirst("div.truncate")?.text(),
+                        element.selectFirst("h1")?.text(),
+                        element.selectFirst("h2")?.text(),
+                        element.selectFirst("h3")?.text(),
+                        element.text(),
+                    )
+
+                if (title.isBlank()) {
+                    return@mapNotNull null
+                }
+
+                val image =
+                    firstNonBlank(
+                        element
+                            .selectFirst("img")
+                            ?.absUrl("src"),
+
+                        element
+                            .selectFirst("img")
+                            ?.absUrl("data-src"),
+
+                        element
+                            .selectFirst("img")
+                            ?.absUrl("data-original"),
+                    )
+
+                SManga.create().apply {
+
+                    setUrlWithoutDomain(href)
+
+                    this.title =
+                        cleanMangaTitle(title)
+
+                    if (image.isNotBlank()) {
+                        thumbnail_url = image
+                    }
+                }
+            }
+            .distinctBy {
+                it.url
+            }
+    }
+
+    // ========================================================================
+    // 搜索
+    // ========================================================================
 
     override suspend fun getSearchMangaList(
         page: Int,
@@ -55,170 +188,89 @@ abstract class Rouman5 : KeiSource() {
         filters: FilterList,
     ): MangasPage {
 
-        /*
-         * 网站目前的搜索：
-         *
-         * /search?term=xxx
-         *
-         * 网站的全部漫画筛选：
-         *
-         * /books?continued=true
-         * /books?continued=false
-         * /books?continued=
-         *
-         * 搜索时网站本身不会同时处理状态筛选，
-         * 所以：
-         *
-         * 1. 有关键词 -> /search
-         * 2. 无关键词 -> /books + filters
-         */
-
-        if (query.isNotBlank()) {
-            val encoded = URLEncoder.encode(
-                query,
-                Charsets.UTF_8,
-            )
-
-            return getMangaList(
-                "$baseUrl/search?term=$encoded&page=${page - 1}",
+        if (query.isBlank()) {
+            return MangasPage(
+                emptyList(),
+                false,
             )
         }
 
-        val statusFilter =
-            filters.filterIsInstance<StatusFilter>().firstOrNull()
+        val encodedQuery =
+            URLEncoder.encode(
+                query,
+                StandardCharsets.UTF_8.name(),
+            )
 
-        val continued =
-            statusFilter?.toUriPart()
-                ?: ""
+        /*
+         * Roumanwu 原实现：
+         *
+         * /search?term=xxx&page=0
+         *
+         * 注意这里是 page - 1。
+         */
 
         val url =
-            buildString {
-                append(baseUrl)
-                append("/books?continued=")
-                append(continued)
-                append("&page=")
-                append(page - 1)
-            }
+            "$baseUrl/search?term=$encodedQuery&page=${page - 1}"
 
-        return getMangaList(url)
-    }
+        val response =
+            client.get(url)
 
-    // ============================================================
-    // Filters
-    // ============================================================
+        val document =
+            Jsoup.parse(
+                response.body.string(),
+                url,
+            )
 
-    override fun getFilterList(): FilterList {
-        return FilterList(
-            Filter.Header(
-                "提示：篩選僅適用於「全部漫畫」",
-            ),
-            StatusFilter(),
+        val entries =
+            parseEntries(document)
+
+        val hasNextPage =
+            document.selectFirst(
+                "div.justify-end > a:contains(下一頁)",
+            ) != null
+
+        return MangasPage(
+            entries,
+            hasNextPage,
         )
     }
 
-    private class StatusFilter :
-        Filter.Select<String>(
-            "狀態",
-            arrayOf(
-                "全部",
-                "連載中",
-                "已完結",
-            ),
-        ) {
-
-        fun toUriPart(): String {
-            return when (state) {
-                1 -> "true"
-                2 -> "false"
-                else -> ""
-            }
-        }
-    }
-
-    // ============================================================
-    // Manga details
-    // ============================================================
+    // ========================================================================
+    // 漫画详情
+    // ========================================================================
 
     override suspend fun getMangaByUrl(
         url: HttpUrl,
     ): SManga? {
 
-        val id =
-            extractMangaId(
-                url.encodedPath,
-            )
+        val mangaId =
+            extractMangaId(url)
 
-        if (id.isBlank()) {
+        if (mangaId.isBlank()) {
             return null
         }
 
         val mangaUrl =
-            "$baseUrl/books/$id"
+            "$baseUrl/books/$mangaId"
 
-        /*
-         * 先使用普通 HTTP。
-         *
-         * 只有页面不完整的时候才进入 WebView。
-         */
+        val response =
+            client.get(mangaUrl)
+
         val document =
-            fetchDocument(
+            Jsoup.parse(
+                response.body.string(),
                 mangaUrl,
             )
 
-        if (document != null) {
-
-            val manga =
-                runCatching {
-                    parseManga(
-                        document,
-                        id,
-                    )
-                }.getOrNull()
-
-            val chapters =
-                runCatching {
-                    parseChapters(
-                        document,
-                        id,
-                    )
-                }.getOrDefault(
-                    emptyList(),
-                )
-
-            if (
-                manga != null &&
-                    manga.title.isNotBlank() &&
-                    chapters.isNotEmpty()
-            ) {
-                return manga
-            }
-        }
-
-        /*
-         * 普通 HTTP 无法取得完整页面时，
-         * 使用 WebView 正常完成网站的年龄确认流程。
-         */
-        val webDocument =
-            fetchDocumentWithWebView(
-                mangaUrl,
-                requireChapters = true,
-            )
-
-        return if (webDocument != null) {
-            runCatching {
-                parseManga(
-                    webDocument,
-                    id,
-                )
-            }.getOrNull()
-        } else {
-            null
-        }
+        return parseManga(
+            document,
+            mangaId,
+        )
     }
 
-    // ============================================================
-    // Manga update
-    // ============================================================
+    // ========================================================================
+    // 漫画详情 + 章节
+    // ========================================================================
 
     override suspend fun fetchMangaUpdate(
         manga: SManga,
@@ -227,1258 +279,758 @@ abstract class Rouman5 : KeiSource() {
         fetchChapters: Boolean,
     ): SMangaUpdate {
 
-        val id =
-            extractMangaId(
-                manga.url,
-            )
+        val mangaId =
+            extractMangaId(manga.url)
 
-        if (id.isBlank()) {
-            throw IllegalStateException(
-                "Missing manga id",
+        if (mangaId.isBlank()) {
+            return SMangaUpdate(
+                manga,
+                chapters,
             )
         }
 
         val mangaUrl =
-            "$baseUrl/books/$id"
+            "$baseUrl/books/$mangaId"
 
-        var document =
-            fetchDocument(
+        val response =
+            client.get(mangaUrl)
+
+        val document =
+            Jsoup.parse(
+                response.body.string(),
                 mangaUrl,
             )
 
-        var details: SManga? =
-            null
-
-        var updatedChapters:
-            List<SChapter> =
-            emptyList()
-
-        if (document != null) {
-
-            details =
-                runCatching {
-                    parseManga(
-                        document,
-                        id,
-                    )
-                }.getOrNull()
-
-            updatedChapters =
-                runCatching {
-                    parseChapters(
-                        document,
-                        id,
-                    )
-                }.getOrDefault(
-                    emptyList(),
+        val updatedManga =
+            if (fetchDetails) {
+                parseManga(
+                    document,
+                    mangaId,
                 )
-        }
-
-        /*
-         * 如果 HTTP 页面没有正常返回章节，
-         * 使用 WebView。
-         */
-        val needWebView =
-            details == null ||
-                details.title.isBlank() ||
-                (
-                    fetchChapters &&
-                        updatedChapters.isEmpty()
-                    )
-
-        if (needWebView) {
-
-            document =
-                fetchDocumentWithWebView(
-                    mangaUrl,
-                    requireChapters = fetchChapters,
-                )
-
-            if (document != null) {
-
-                details =
-                    runCatching {
-                        parseManga(
-                            document,
-                            id,
-                        )
-                    }.getOrNull()
-
-                updatedChapters =
-                    runCatching {
-                        parseChapters(
-                            document,
-                            id,
-                        )
-                    }.getOrDefault(
-                        emptyList(),
-                    )
-            }
-        }
-
-        val finalManga =
-            if (
-                fetchDetails &&
-                    details != null
-            ) {
-                details
             } else {
                 manga
             }
 
-        if (finalManga.title.isBlank()) {
-            throw IllegalStateException(
-                "Missing manga title: $mangaUrl",
-            )
-        }
-
-        val finalChapters =
+        val updatedChapters =
             if (fetchChapters) {
-
-                if (updatedChapters.isEmpty()) {
-                    throw IllegalStateException(
-                        "No chapters found: $mangaUrl",
-                    )
-                }
-
-                updatedChapters
+                parseChapters(
+                    document,
+                    mangaId,
+                )
             } else {
                 chapters
             }
 
         return SMangaUpdate(
-            finalManga,
-            finalChapters,
+            updatedManga,
+            updatedChapters,
         )
     }
 
-    // ============================================================
-    // Chapter pages
-    // ============================================================
-
-    override suspend fun getPageList(
-        chapter: SChapter,
-    ): List<Page> {
-
-        val chapterUrl =
-            getChapterUrl(
-                chapter,
-            )
-
-        /*
-         * 使用 WebView：
-         *
-         * 1. 正常打开章节
-         * 2. 如果出现 18+ 页面，点击网站自己的确认按钮
-         * 3. 等待真正漫画图片出现
-         * 4. 滚动触发懒加载
-         * 5. 反复读取图片
-         * 6. 最终返回稳定的图片列表
-         */
-
-        val result =
-            withTimeoutOrNull(
-                60.seconds,
-            ) {
-
-                runWebView<String> {
-
-                    javaScriptEnabled = true
-                    domStorageEnabled = true
-
-                    loadUrl(
-                        chapterUrl,
-                    )
-
-                    onPageFinished {
-
-                        poll(
-                            500.milliseconds,
-                        ) {
-
-                            evaluateJs(
-                                """
-                                (() => {
-
-                                    // ------------------------------------------------
-                                    // 1. 正常处理网站年龄确认
-                                    // ------------------------------------------------
-
-                                    const elements =
-                                        Array.from(
-                                            document.querySelectorAll(
-                                                "button, a"
-                                            )
-                                        );
-
-                                    const gate =
-                                        elements.find(
-                                            el => {
-
-                                                const text =
-                                                    (
-                                                        el.innerText ||
-                                                        el.textContent ||
-                                                        ""
-                                                    )
-                                                    .replace(
-                                                        /\s+/g,
-                                                        ""
-                                                    )
-                                                    .trim();
-
-                                                return (
-                                                    text.includes(
-                                                        "我已滿18歲"
-                                                    ) ||
-                                                    text.includes(
-                                                        "我已滿18"
-                                                    ) ||
-                                                    text.includes(
-                                                        "我已满18岁"
-                                                    ) ||
-                                                    text.includes(
-                                                        "我已满18"
-                                                    )
-                                                );
-                                            }
-                                        );
-
-                                    if (gate) {
-
-                                        gate.click();
-
-                                        return "";
-                                    }
-
-                                    // ------------------------------------------------
-                                    // 2. 触发懒加载
-                                    // ------------------------------------------------
-
-                                    const height =
-                                        document.body
-                                            ? document.body.scrollHeight
-                                            : 0;
-
-                                    window.scrollTo(
-                                        0,
-                                        height
-                                    );
-
-                                    // ------------------------------------------------
-                                    // 3. 找到真正的漫画图片
-                                    // ------------------------------------------------
-
-                                    const images =
-                                        Array.from(
-                                            document.querySelectorAll(
-                                                "img"
-                                            )
-                                        )
-                                        .map(
-                                            img => {
-
-                                                const src =
-                                                    img.currentSrc ||
-                                                    img.src ||
-                                                    img.getAttribute(
-                                                        "data-src"
-                                                    ) ||
-                                                    img.getAttribute(
-                                                        "data-original"
-                                                    ) ||
-                                                    img.getAttribute(
-                                                        "data-lazy-src"
-                                                    ) ||
-                                                    "";
-
-                                                return {
-                                                    img: img,
-                                                    src: src
-                                                };
-                                            }
-                                        )
-                                        .filter(
-                                            item => {
-
-                                                const img =
-                                                    item.img;
-
-                                                const src =
-                                                    item.src;
-
-                                                if (!src) {
-                                                    return false;
-                                                }
-
-                                                // data URI
-                                                if (
-                                                    src.startsWith(
-                                                        "data:"
-                                                    )
-                                                ) {
-                                                    return false;
-                                                }
-
-                                                const lower =
-                                                    src.toLowerCase();
-
-                                                // 网站 UI / 占位图片
-                                                if (
-                                                    lower.includes(
-                                                        "loading"
-                                                    ) ||
-                                                    lower.includes(
-                                                        "placeholder"
-                                                    ) ||
-                                                    lower.includes(
-                                                        "logo"
-                                                    ) ||
-                                                    lower.includes(
-                                                        "favicon"
-                                                    ) ||
-                                                    lower.includes(
-                                                        "avatar"
-                                                    ) ||
-                                                    lower.includes(
-                                                        "icon"
-                                                    )
-                                                ) {
-                                                    return false;
-                                                }
-
-                                                // 必须是图片 URL
-                                                if (
-                                                    !(
-                                                        lower.includes(
-                                                            ".jpg"
-                                                        ) ||
-                                                        lower.includes(
-                                                            ".jpeg"
-                                                        ) ||
-                                                        lower.includes(
-                                                            ".png"
-                                                        ) ||
-                                                        lower.includes(
-                                                            ".webp"
-                                                        )
-                                                    )
-                                                ) {
-                                                    return false;
-                                                }
-
-                                                // 排除明显的小型 UI 图片
-                                                const width =
-                                                    img.naturalWidth ||
-                                                    img.width ||
-                                                    0;
-
-                                                const height =
-                                                    img.naturalHeight ||
-                                                    img.height ||
-                                                    0;
-
-                                                if (
-                                                    width > 0 &&
-                                                    height > 0 &&
-                                                    (
-                                                        width < 200 ||
-                                                        height < 200
-                                                    )
-                                                ) {
-                                                    return false;
-                                                }
-
-                                                return true;
-                                            }
-                                        );
-
-                                    // ------------------------------------------------
-                                    // 4. 按 DOM 顺序去重
-                                    // ------------------------------------------------
-
-                                    const urls = [];
-
-                                    const seen =
-                                        new Set();
-
-                                    for (
-                                        const item
-                                        of images
-                                    ) {
-
-                                        const url =
-                                            item.src
-                                                .trim();
-
-                                        if (
-                                            !url ||
-                                            seen.has(url)
-                                        ) {
-                                            continue;
-                                        }
-
-                                        seen.add(url);
-                                        urls.push(url);
-                                    }
-
-                                    // ------------------------------------------------
-                                    // 5. 只有真正找到漫画图片后才返回
-                                    // ------------------------------------------------
-
-                                    if (
-                                        urls.length > 0
-                                    ) {
-
-                                        return urls.join(
-                                            "\\n"
-                                        );
-                                    }
-
-                                    return "";
-
-                                })();
-                                """.trimIndent(),
-                            ) { value ->
-
-                                if (
-                                    value.isNotBlank()
-                                ) {
-                                    resolve(
-                                        value,
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-        val urls =
-            result
-                ?.trim()
-                ?.removePrefix("\"")
-                ?.removeSuffix("\"")
-                ?.replace(
-                    "\\n",
-                    "\n",
-                )
-                ?.replace(
-                    "\\/",
-                    "/",
-                )
-                ?.split('\n')
-                ?.map {
-                    it.trim()
-                }
-                ?.filter {
-                    it.startsWith(
-                        "https://",
-                    ) ||
-                        it.startsWith(
-                            "http://",
-                        )
-                }
-                ?.filterNot {
-                    isInvalidImageUrl(
-                        it,
-                    )
-                }
-                ?.distinct()
-                .orEmpty()
-
-        /*
-         * 最终再做一次 Kotlin 层去重。
-         *
-         * 这样即使 WebView 返回重复图片，
-         * Tachimanga 也不会出现重复 Page。
-         */
-        return urls
-            .distinct()
-            .mapIndexed {
-                    index,
-                    imageUrl,
-                ->
-                Page(
-                    index,
-                    imageUrl = imageUrl,
-                )
-            }
-    }
-
-    // ============================================================
-    // Manga URL
-    // ============================================================
-
-    override fun getMangaUrl(
-        manga: SManga,
-    ): String {
-
-        val id =
-            extractMangaId(
-                manga.url,
-            )
-
-        return "$baseUrl/books/$id"
-    }
-
-    // ============================================================
-    // Chapter URL
-    // ============================================================
-
-    override fun getChapterUrl(
-        chapter: SChapter,
-    ): String {
-
-        val url =
-            chapter.url
-
-        return when {
-
-            url.startsWith(
-                "http://",
-            ) ->
-                url
-
-            url.startsWith(
-                "https://",
-            ) ->
-                url
-
-            url.startsWith(
-                "/",
-            ) ->
-                "$baseUrl$url"
-
-            else ->
-                "$baseUrl/$url"
-        }
-    }
-
-    // ============================================================
-    // Manga list
-    // ============================================================
-
-    private suspend fun getMangaList(
-        url: String,
-    ): MangasPage {
-
-        val document =
-            fetchDocument(
-                url,
-            )
-                ?: return MangasPage(
-                    emptyList(),
-                    false,
-                )
-
-        val mangas =
-            document
-                .select(
-                    "a[href^=/books/]",
-                )
-                .mapNotNull { anchor ->
-
-                    val href =
-                        anchor.absUrl(
-                            "href",
-                        )
-
-                    if (
-                        href.isBlank()
-                    ) {
-                        return@mapNotNull null
-                    }
-
-                    val path =
-                        href
-                            .substringAfter(
-                                "/books/",
-                                "",
-                            )
-                            .trim('/')
-
-                    /*
-                     * 排除章节 URL：
-                     *
-                     * /books/mangaId/chapterId
-                     */
-                    if (
-                        path.isBlank() ||
-                            path.contains("/")
-                    ) {
-                        return@mapNotNull null
-                    }
-
-                    val title =
-                        anchor
-                            .select(
-                                "h1, h2, h3, h4, span",
-                            )
-                            .firstOrNull()
-                            ?.text()
-                            ?.trim()
-                            ?.takeIf {
-                                it.isNotEmpty()
-                            }
-                            ?: anchor.text()
-                                .trim()
-
-                    if (
-                        title.isBlank()
-                    ) {
-                        return@mapNotNull null
-                    }
-
-                    val image =
-                        anchor
-                            .select(
-                                "img",
-                            )
-                            .firstOrNull()
-                            ?.let { image ->
-
-                                image
-                                    .absUrl(
-                                        "src",
-                                    )
-                                    .ifBlank {
-
-                                        image.absUrl(
-                                            "data-src",
-                                        )
-                                            .ifBlank {
-
-                                                image.absUrl(
-                                                    "data-original",
-                                                )
-                                            }
-                                    }
-                            }
-                            .orEmpty()
-
-                    SManga.create().apply {
-
-                        setUrlWithoutDomain(
-                            href,
-                        )
-
-                        this.title =
-                            cleanMangaTitle(
-                                title,
-                            )
-
-                        thumbnail_url =
-                            image
-                    }
-                }
-                .distinctBy {
-                    it.url
-                }
-
-        val hasNext =
-            document
-                .select(
-                    "a",
-                )
-                .any { link ->
-
-                    val text =
-                        link.text()
-
-                    text.contains(
-                        "下一頁",
-                    ) ||
-                        text.contains(
-                            "下一页",
-                        ) ||
-                        text.contains(
-                            "Next",
-                            ignoreCase = true,
-                        )
-                }
-
-        return MangasPage(
-            mangas,
-            hasNext,
-        )
-    }
-
-    // ============================================================
-    // Parse manga
-    // ============================================================
+    // ========================================================================
+    // 解析漫画详情
+    // ========================================================================
 
     private fun parseManga(
         document: Document,
-        id: String,
+        mangaId: String,
     ): SManga {
 
         val manga =
             SManga.create()
 
         manga.setUrlWithoutDomain(
-            "$baseUrl/books/$id",
+            "$baseUrl/books/$mangaId",
         )
 
+        /*
+         * 优先按照 Roumanwu 的实际页面结构解析。
+         */
+
         val title =
-            listOf(
-                document
-                    .select("h1")
-                    .firstOrNull()
-                    ?.text(),
+            firstNonBlank(
+                document.selectFirst(
+                    "div.basis-3\\/5 > div.text-xl",
+                )?.text(),
 
-                document
-                    .select(
-                        "meta[property=og:title]",
-                    )
-                    .firstOrNull()
-                    ?.attr(
-                        "content",
-                    ),
+                document.selectFirst("h1")?.text(),
 
-                document
-                    .select(
-                        "meta[name=twitter:title]",
-                    )
-                    .firstOrNull()
-                    ?.attr(
-                        "content",
-                    ),
+                document.selectFirst(
+                    "meta[property=og:title]",
+                )?.attr("content"),
 
                 document.title(),
             )
-                .asSequence()
-                .map {
-                    it.orEmpty()
-                }
-                .map {
-                    cleanMangaTitle(
-                        it,
-                    )
-                }
-                .firstOrNull {
-                    it.isNotBlank() &&
-                        !it.equals(
-                            "肉漫屋",
-                            ignoreCase = true,
-                        )
-                }
-                .orEmpty()
-
-        if (
-            title.isBlank()
-        ) {
-            throw IllegalStateException(
-                "Missing manga title: $baseUrl/books/$id",
-            )
-        }
 
         manga.title =
-            title
+            cleanMangaTitle(title)
 
-        manga.thumbnail_url =
-            document
-                .select(
-                    "meta[property=og:image]",
-                )
-                .firstOrNull()
-                ?.attr(
-                    "content",
-                )
-                .orEmpty()
-                .ifBlank {
+        /*
+         * 封面
+         */
 
-                    document
-                        .select(
-                            "img",
-                        )
-                        .firstOrNull()
-                        ?.let { image ->
+        val thumbnail =
+            firstNonBlank(
 
-                            image
-                                .absUrl(
-                                    "src",
-                                )
-                                .ifBlank {
-
-                                    image.absUrl(
-                                        "data-src",
-                                    )
-                                        .ifBlank {
-
-                                            image.absUrl(
-                                                "data-original",
-                                            )
-                                        }
-                                }
-                        }
-                        .orEmpty()
-                }
-
-        val bodyText =
-            document
-                .body()
-                ?.text()
-                .orEmpty()
-
-        manga.author =
-            extractInfo(
-                bodyText,
-                "作者",
-            )
-
-        manga.genre =
-            extractInfo(
-                bodyText,
-                "標籤",
-            )
-
-        manga.description =
-            extractDescription(
-                document,
-            )
-
-        val status =
-            extractInfo(
-                bodyText,
-                "狀態",
-            )
-
-        manga.status =
-            if (
-                status.contains(
-                    "完結",
-                ) ||
-                    status.contains(
-                        "完结",
+                document
+                    .selectFirst(
+                        "div.basis-2\\/5 img",
                     )
-            ) {
-                SManga.COMPLETED
-            } else {
-                SManga.ONGOING
+                    ?.absUrl("src"),
+
+                document
+                    .selectFirst(
+                        "meta[property=og:image]",
+                    )
+                    ?.attr("content"),
+
+                document
+                    .selectFirst("img")
+                    ?.absUrl("src"),
+
+                document
+                    .selectFirst("img")
+                    ?.absUrl("data-src"),
+            )
+
+        if (thumbnail.isNotBlank()) {
+            manga.thumbnail_url =
+                thumbnail
+        }
+
+        /*
+         * 尝试读取信息框。
+         */
+
+        val info =
+            document.selectFirst(
+                "div.basis-3\\/5",
+            )
+
+        if (info != null) {
+
+            val lines =
+                info.children()
+                    .map {
+                        it.text().trim()
+                    }
+                    .filter {
+                        it.isNotBlank()
+                    }
+
+            val genres =
+                mutableListOf<String>()
+
+            for (line in lines) {
+
+                when {
+
+                    line.startsWith("作者:") -> {
+                        manga.author =
+                            line.removePrefix("作者:")
+                                .trim()
+                    }
+
+                    line.startsWith("狀態:") -> {
+
+                        val value =
+                            line.removePrefix("狀態:")
+                                .trim()
+
+                        manga.status =
+                            when (value) {
+                                "連載中" ->
+                                    SManga.ONGOING
+
+                                "已完結" ->
+                                    SManga.COMPLETED
+
+                                else ->
+                                    SManga.UNKNOWN
+                            }
+                    }
+
+                    line.startsWith("地區:") -> {
+
+                        val value =
+                            line.removePrefix("地區:")
+                                .trim()
+
+                        if (value.isNotBlank()) {
+                            genres += value
+                        }
+                    }
+
+                    line.startsWith("標籤:") -> {
+
+                        val value =
+                            line.removePrefix("標籤:")
+                                .trim()
+
+                        if (value.isNotBlank()) {
+
+                            genres +=
+                                value
+                                    .split(",")
+                                    .map {
+                                        it.trim()
+                                    }
+                                    .filter {
+                                        it.isNotBlank()
+                                    }
+                        }
+                    }
+                }
             }
+
+            if (genres.isNotEmpty()) {
+                manga.genre =
+                    genres.distinct()
+                        .joinToString(", ")
+            }
+        }
+
+        /*
+         * 简介
+         */
+
+        val description =
+            firstNonBlank(
+
+                document
+                    .selectFirst(
+                        "p:contains(簡介:)",
+                    )
+                    ?.text()
+                    ?.removePrefix("簡介:")
+                    ?.trim(),
+
+                document
+                    .selectFirst(
+                        ".description",
+                    )
+                    ?.text(),
+
+                document
+                    .selectFirst(
+                        ".summary",
+                    )
+                    ?.text(),
+            )
+
+        if (description.isNotBlank()) {
+            manga.description =
+                description
+        }
+
+        if (
+            manga.status == 0
+        ) {
+            manga.status =
+                SManga.UNKNOWN
+        }
 
         return manga
     }
 
-    // ============================================================
-    // Parse chapters
-    // ============================================================
+    // ========================================================================
+    // 章节
+    // ========================================================================
 
     private fun parseChapters(
         document: Document,
-        id: String,
+        mangaId: String,
     ): List<SChapter> {
+
+        val prefix =
+            "/books/$mangaId/"
 
         return document
             .select(
-                "a[href*=\"/books/$id/\"]",
+                "a[href*=\"$prefix\"]",
             )
+            .filter { element ->
+
+                /*
+                 * 必须是：
+                 *
+                 * /books/{mangaId}/{chapterId}
+                 *
+                 * 而不是：
+                 *
+                 * /books/{mangaId}
+                 */
+
+                val href =
+                    element.attr("href")
+
+                val path =
+                    href
+                        .substringBefore("?")
+                        .trim('/')
+
+                val parts =
+                    path.split('/')
+
+                parts.size >= 3 &&
+                    parts[0] == "books" &&
+                    parts[1] == mangaId
+            }
             .mapNotNull { link ->
 
                 val href =
-                    link.absUrl(
-                        "href",
-                    )
+                    link.absUrl("href")
 
-                if (
-                    href.isBlank()
-                ) {
+                if (href.isBlank()) {
                     return@mapNotNull null
                 }
 
                 val chapterId =
-                    href
-                        .substringAfter(
-                            "/books/$id/",
-                            "",
-                        )
-                        .trim('/')
+                    extractChapterId(
+                        href,
+                        mangaId,
+                    )
 
-                if (
-                    chapterId.isBlank() ||
-                        chapterId.contains("/")
-                ) {
+                if (chapterId.isBlank()) {
                     return@mapNotNull null
                 }
 
                 val name =
-                    link.text()
-                        .trim()
+                    link.text().trim()
 
-                if (
-                    name.isBlank()
-                ) {
+                if (name.isBlank()) {
                     return@mapNotNull null
                 }
 
                 SChapter.create().apply {
 
                     setUrlWithoutDomain(
-                        href,
+                        "$baseUrl/books/$mangaId/$chapterId",
                     )
 
                     this.name =
                         name
+
+                    chapter_number =
+                        extractChapterNumber(
+                            name,
+                        )
+
+                    date_upload = 0L
                 }
             }
             .distinctBy {
                 it.url
             }
-            .reversed()
+            .asReversed()
     }
 
-    // ============================================================
-    // HTTP document
-    // ============================================================
+    // ========================================================================
+    // ★★★ 阅读章节 ★★★
+    //
+    // 这里是本次最重要的修改。
+    //
+    // 不再请求：
+    //
+    // /api/books/...
+    //
+    // 而是请求：
+    //
+    // /books/{mangaId}/{chapterId}
+    //
+    // 并添加：
+    //
+    // rsc: 1
+    //
+    // 与你提供的 Roumanwu 源保持一致。
+    // ========================================================================
 
-    private suspend fun fetchDocument(
-        url: String,
-    ): Document? {
+    override suspend fun getPageList(
+        chapter: SChapter,
+    ): List<Page> {
 
-        return runCatching {
+        val chapterUrl =
+            getChapterUrl(chapter)
 
-            client
-                .get(
-                    url,
+        val request =
+            Request.Builder()
+                .url(chapterUrl)
+                .headers(headers)
+                .addHeader(
+                    "rsc",
+                    "1",
                 )
-                .use { response ->
+                .get()
+                .build()
 
-                    Jsoup.parse(
-                        response.body.string(),
-                        url,
-                    )
-                }
+        val response =
+            client.newCall(request)
+                .execute()
 
-        }.getOrNull()
-    }
+        if (!response.isSuccessful) {
 
-    // ============================================================
-    // WebView document
-    // ============================================================
-
-    private suspend fun fetchDocumentWithWebView(
-        url: String,
-        requireChapters: Boolean,
-    ): Document? {
-
-        val html =
-            runCatching {
-
-                runWebView<String>(
-                    timeout = 30.seconds,
-                ) {
-
-                    javaScriptEnabled =
-                        true
-
-                    domStorageEnabled =
-                        true
-
-                    loadUrl(
-                        url,
-                    )
-
-                    onPageFinished {
-
-                        poll(
-                            500.milliseconds,
-                        ) {
-
-                            evaluateJs(
-                                """
-                                (() => {
-
-                                    // ============================================
-                                    // 正常处理网站年龄确认
-                                    // ============================================
-
-                                    const elements =
-                                        Array.from(
-                                            document.querySelectorAll(
-                                                "button, a"
-                                            )
-                                        );
-
-                                    const gate =
-                                        elements.find(
-                                            el => {
-
-                                                const text =
-                                                    (
-                                                        el.innerText ||
-                                                        el.textContent ||
-                                                        ""
-                                                    )
-                                                    .replace(
-                                                        /\s+/g,
-                                                        ""
-                                                    )
-                                                    .trim();
-
-                                                return (
-                                                    text.includes(
-                                                        "我已滿18歲"
-                                                    ) ||
-                                                    text.includes(
-                                                        "我已滿18"
-                                                    ) ||
-                                                    text.includes(
-                                                        "我已满18岁"
-                                                    ) ||
-                                                    text.includes(
-                                                        "我已满18"
-                                                    )
-                                                );
-                                            }
-                                        );
-
-                                    if (gate) {
-
-                                        gate.click();
-
-                                        return "";
-                                    }
-
-                                    // ============================================
-                                    // 页面已经进入正常内容
-                                    // ============================================
-
-                                    const title =
-                                        document.querySelector(
-                                            "h1"
-                                        );
-
-                                    const chapters =
-                                        document.querySelector(
-                                            'a[href*="/books/"]'
-                                        );
-
-                                    if (
-                                        title &&
-                                        title.textContent.trim() &&
-                                        (
-                                            !${requireChapters} ||
-                                            chapters
-                                        )
-                                    ) {
-
-                                        return document
-                                            .documentElement
-                                            .outerHTML;
-                                    }
-
-                                    return "";
-
-                                })();
-                                """.trimIndent(),
-                            ) { value ->
-
-                                if (
-                                    value.isNotBlank()
-                                ) {
-                                    resolve(
-                                        value,
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-
-            }.getOrNull()
-
-        if (
-            html.isNullOrBlank()
-        ) {
-            return null
+            throw IllegalStateException(
+                "Chapter page failed: HTTP ${response.code}",
+            )
         }
 
-        return runCatching {
+        val html =
+            response.body.string()
 
-            Jsoup.parse(
-                html,
-                url,
+        if (html.isBlank()) {
+
+            throw IllegalStateException(
+                "Empty chapter response: $chapterUrl",
             )
+        }
 
-        }.getOrNull()
+        return parsePages(
+            html,
+        )
     }
 
-    // ============================================================
-    // Image URL validation
-    // ============================================================
+    // ========================================================================
+    // 解析章节图片
+    // ========================================================================
 
-    private fun isInvalidImageUrl(
+    private fun parsePages(
+        html: String,
+    ): List<Page> {
+
+        /*
+         * Roumanwu 的关键：
+         *
+         * "imageUrl":"https://..."
+         *
+         * 所以 Rouman5 也优先使用 imageUrl。
+         */
+
+        val regex =
+            Regex(
+                """"imageUrl":"([^"]+)"""",
+            )
+
+        val urls =
+            regex
+                .findAll(html)
+                .map {
+                    it.groupValues[1]
+                }
+                .map {
+                    decodeJsonUrl(it)
+                }
+                .filter {
+                    isValidImageUrl(it)
+                }
+                .distinct()
+                .toList()
+
+        if (urls.isEmpty()) {
+
+            /*
+             * 备用：
+             *
+             * 如果 Next.js 返回的数据中字段变成 src，
+             * 再尝试 src。
+             */
+
+            val srcRegex =
+                Regex(
+                    """"src":"(https?://[^"]+)"""",
+                )
+
+            val fallback =
+                srcRegex
+                    .findAll(html)
+                    .map {
+                        it.groupValues[1]
+                    }
+                    .map {
+                        decodeJsonUrl(it)
+                    }
+                    .filter {
+                        isValidImageUrl(it)
+                    }
+                    .distinct()
+                    .toList()
+
+            if (fallback.isNotEmpty()) {
+
+                return fallback.mapIndexed { index, url ->
+
+                    Page(
+                        index = index,
+                        imageUrl = url,
+                    )
+                }
+            }
+
+            throw IllegalStateException(
+                "No manga images found in chapter response",
+            )
+        }
+
+        return urls.mapIndexed { index, url ->
+
+            Page(
+                index = index,
+                imageUrl = url,
+            )
+        }
+    }
+
+    // ========================================================================
+    // 图片 URL
+    // ========================================================================
+
+    private fun isValidImageUrl(
         url: String,
     ): Boolean {
+
+        if (url.isBlank()) {
+            return false
+        }
+
+        if (
+            !url.startsWith("http://") &&
+            !url.startsWith("https://")
+        ) {
+            return false
+        }
 
         val lower =
             url.lowercase()
 
-        if (
-            lower.contains(
-                "loading",
-            )
-        ) {
-            return true
-        }
-
-        if (
-            lower.contains(
-                "placeholder",
-            )
-        ) {
-            return true
-        }
-
-        if (
-            lower.contains(
-                "logo",
-            )
-        ) {
-            return true
-        }
-
-        if (
-            lower.contains(
+        val blocked =
+            listOf(
                 "favicon",
-            )
-        ) {
-            return true
-        }
-
-        if (
-            lower.contains(
+                "banner",
                 "avatar",
+                "loading",
+                "placeholder",
+                "doubleclick",
+                "googlead",
+                "ads.",
+                "/ads/",
             )
-        ) {
-            return true
-        }
 
-        if (
-            lower.contains(
-                "icon",
-            )
-        ) {
-            return true
+        return blocked.none {
+            lower.contains(it)
         }
-
-        if (
-            lower.startsWith(
-                "data:",
-            )
-        ) {
-            return true
-        }
-
-        return false
     }
 
-    // ============================================================
-    // ID
-    // ============================================================
-
-    private fun extractMangaId(
-        value: String,
+    private fun decodeJsonUrl(
+        url: String,
     ): String {
 
-        return value
-            .substringAfter(
-                "/books/",
-                value,
-            )
-            .trim('/')
+        return url
+            .replace("\\/", "/")
+            .replace("\\u002F", "/")
+            .replace("\\u002f", "/")
+            .replace("\\u003A", ":")
+            .replace("\\u003a", ":")
+    }
+
+    // ========================================================================
+    // Manga URL
+    // ========================================================================
+
+    override fun getMangaUrl(
+        manga: SManga,
+    ): String {
+
+        val url =
+            manga.url.trim('/')
+
+        return when {
+
+            url.startsWith("http://") ||
+                url.startsWith("https://") -> {
+                url
+            }
+
+            url.startsWith("books/") -> {
+                "$baseUrl/$url"
+            }
+
+            else -> {
+                "$baseUrl/books/$url"
+            }
+        }
+    }
+
+    // ========================================================================
+    // Chapter URL
+    // ========================================================================
+
+    override fun getChapterUrl(
+        chapter: SChapter,
+    ): String {
+
+        val url =
+            chapter.url.trim('/')
+
+        return when {
+
+            url.startsWith("http://") ||
+                url.startsWith("https://") -> {
+                url
+            }
+
+            url.startsWith("books/") -> {
+                "$baseUrl/$url"
+            }
+
+            else -> {
+                "$baseUrl/books/$url"
+            }
+        }
+    }
+
+    // ========================================================================
+    // Manga ID
+    // ========================================================================
+
+    private fun extractMangaId(
+        url: HttpUrl,
+    ): String {
+
+        return extractMangaId(
+            url.encodedPath,
+        )
+    }
+
+    private fun extractMangaId(
+        url: String,
+    ): String {
+
+        val path =
+            url
+                .substringBefore("?")
+                .trim('/')
+
+        val parts =
+            path.split('/')
+
+        val booksIndex =
+            parts.indexOfFirst {
+                it.equals(
+                    "books",
+                    ignoreCase = true,
+                )
+            }
+
+        if (
+            booksIndex >= 0 &&
+            booksIndex + 1 < parts.size
+        ) {
+            return parts[
+                booksIndex + 1
+            ]
+        }
+
+        return path
+            .removePrefix("books/")
             .substringBefore('/')
             .trim()
     }
 
-    // ============================================================
-    // Title cleanup
-    // ============================================================
+    // ========================================================================
+    // Chapter ID
+    // ========================================================================
 
-    private fun cleanMangaTitle(
-        value: String,
+    private fun extractChapterId(
+        url: String,
+        mangaId: String,
     ): String {
 
-        return value
+        val path =
+            url
+                .substringBefore("?")
+                .trim('/')
+
+        val parts =
+            path.split('/')
+
+        val booksIndex =
+            parts.indexOfFirst {
+                it.equals(
+                    "books",
+                    ignoreCase = true,
+                )
+            }
+
+        if (
+            booksIndex >= 0 &&
+            booksIndex + 2 < parts.size
+        ) {
+
+            val id =
+                parts[
+                    booksIndex + 2
+                ]
+
+            if (id.isNotBlank()) {
+                return id
+            }
+        }
+
+        return ""
+    }
+
+    // ========================================================================
+    // Chapter number
+    // ========================================================================
+
+    private fun extractChapterNumber(
+        text: String,
+    ): Float {
+
+        val match =
+            Regex(
+                """(?i)(?:chapter|chap|第)\s*([0-9]+(?:\.[0-9]+)?)""",
+            ).find(text)
+
+        return match
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.toFloatOrNull()
+            ?: 0F
+    }
+
+    // ========================================================================
+    // 清理标题
+    // ========================================================================
+
+    private fun cleanMangaTitle(
+        title: String,
+    ): String {
+
+        return title
+            .trim()
             .replace(
                 Regex(
                     """\s*[-|｜]\s*肉漫屋.*$""",
+                    RegexOption.IGNORE_CASE,
                 ),
                 "",
             )
             .trim()
     }
 
-    // ============================================================
-    // Info
-    // ============================================================
+    // ========================================================================
+    // 第一个非空字符串
+    // ========================================================================
 
-    private fun extractInfo(
-        text: String,
-        label: String,
+    private fun firstNonBlank(
+        vararg values: String?,
     ): String {
 
-        val regex =
-            Regex(
-                """$label\s+(.+?)(?=\s+(作者|狀態|地區|更新|標籤)\s+|$)""",
-            )
-
-        return regex
-            .find(text)
-            ?.groupValues
-            ?.getOrNull(1)
-            .orEmpty()
-    }
-
-    // ============================================================
-    // Description
-    // ============================================================
-
-    private fun extractDescription(
-        document: Document,
-    ): String {
-
-        val text =
-            document
-                .body()
-                ?.text()
-                .orEmpty()
-
-        val markers =
-            listOf(
-                "簡介:",
-                "簡介：",
-                "敘述:",
-                "敘述：",
-            )
-
-        for (
-            marker in markers
-        ) {
-
-            val index =
-                text.indexOf(
-                    marker,
-                )
-
-            if (
-                index >= 0
-            ) {
-
-                return text
-                    .substring(
-                        index +
-                            marker.length,
-                    )
-                    .substringBefore(
-                        "放入書架",
-                    )
-                    .trim()
+        return values
+            .firstOrNull {
+                !it.isNullOrBlank()
             }
-        }
-
-        return ""
+            ?.trim()
+            ?: ""
     }
 }
-```
