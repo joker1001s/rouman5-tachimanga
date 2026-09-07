@@ -1,0 +1,31 @@
+{
+  "name": "Rouman5",
+  "badgeLabel": "ROU",
+  "signingKey": "845011207da014e2f7b7f846800e9d5f9b8a997eee7e120ce82f46b383267794",
+  "contact": {
+    "website": "https://github.com/joker1001s/rouman5-tachimanga"
+  },
+  "extensionList": {
+    "extensions": [
+      {
+        "name": "\u8089\u6f2b\u5c4b",
+        "packageName": "eu.kanade.tachiyomi.extension.zh.rouman5",
+        "resources": {
+          "apkUrl": "https://raw.githubusercontent.com/joker1001s/rouman5-tachimanga/repo/apk/tachiyomi-zh.rouman5-v1.6.1.apk"
+        },
+        "extensionLib": "1.6",
+        "versionCode": "1",
+        "versionName": "1.6.1",
+        "contentWarning": "CONTENT_WARNING_NSFW",
+        "sources": [
+          {
+            "id": "6000000000000099",
+            "name": "\u8089\u6f2b\u5c4b",
+            "language": "zh",
+            "homeUrl": "https://rouman5.com"
+          }
+        ]
+      }
+    ]
+  }
+}
