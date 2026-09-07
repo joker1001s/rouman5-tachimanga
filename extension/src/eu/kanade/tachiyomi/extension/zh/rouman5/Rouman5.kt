@@ -12,6 +12,7 @@ import keiyoushi.network.get
 import keiyoushi.source.KeiSource
 import kotlinx.serialization.json.JsonElement
 import okhttp3.HttpUrl
+import okhttp3.OkHttpClient
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
@@ -22,6 +23,20 @@ import java.nio.charset.StandardCharsets
 abstract class Rouman5 : KeiSource() {
 
     override val supportsLatest = true
+
+    /**
+     * 肉漫屋漫画图片需要经过分块还原。
+     *
+     * KeiSource 的 client 是 final，
+     * 因此不能 override val client。
+     *
+     * 必须通过 configureClient() 添加拦截器。
+     */
+    override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder {
+        return addInterceptor(
+            ScrambledImageInterceptor(),
+        )
+    }
 
     // ========================================================================
     // Filters
@@ -870,50 +885,42 @@ abstract class Rouman5 : KeiSource() {
     // ========================================================================
     // 阅读章节
     // ========================================================================
-
+    
     override suspend fun getPageList(
         chapter: SChapter,
     ): List<Page> {
-
+    
         val chapterUrl =
             getChapterUrl(
                 chapter,
             )
-
+    
         /*
-         * Important:
+         * 肉漫屋使用 Next.js。
          *
-         * Do NOT request the RSC response here.
+         * 章节页面中的漫画图片信息可能存在于：
          *
-         * The old implementation used:
+         * 1. Next.js RSC 数据
+         * 2. imageUrl 字段
+         * 3. images 数组
          *
-         *     rsc: 1
+         * 因此这里直接获取普通章节 HTML/RSC 页面，
+         * 后续统一由 parsePages() 提取。
          *
-         * and then searched every "imageUrl" in the
-         * complete RSC response.
-         *
-         * That response may contain images belonging to:
-         *
-         * - current chapter
-         * - recommendations
-         * - preload data
-         * - other Next.js components
-         *
-         * This can produce duplicated or overlapping
-         * pages in Tachimanga.
+         * 不再直接使用 client.newCall().execute()，
+         * 因为 KeiSource 1.6 应使用 suspend client.get()。
          */
-
         val html =
             client.get(
                 chapterUrl,
             ).use {
                 it.body.string()
             }
-
+    
         if (html.isBlank()) {
             return emptyList()
         }
-
+    
         return parsePages(
             html,
             chapterUrl,
@@ -923,83 +930,42 @@ abstract class Rouman5 : KeiSource() {
     // ========================================================================
     // 解析章节图片
     // ========================================================================
-
+    
     private fun parsePages(
         html: String,
         pageUrl: String,
     ): List<Page> {
-
-        val document =
-            Jsoup.parse(
-                html,
-                pageUrl,
-            )
-
+    
         /*
-         * First try to locate images inside the reader/chapter
-         * area.
+         * 肉漫屋当前漫画图片有非常明确的特征：
          *
-         * This is important because selecting every <img>
-         * on the page can also return:
+         *     /sr:1/
          *
-         * - logo
-         * - avatar
-         * - recommended manga
-         * - banners
-         * - footer images
+         * 上游图片拦截器也是通过这个字段判断漫画图片。
+         *
+         * 因此这里不再把普通 img、广告图片、
+         * banner、loading 图片等直接当作漫画页面。
          */
-
-        val imageElements =
-            document.select(
-                """
-                main img,
-                article img,
-                [class*=reader] img,
-                [id*=reader] img,
-                [class*=chapter] img,
-                [id*=chapter] img
-                """.trimIndent(),
-            ).ifEmpty {
-
-                /*
-                 * Fallback for pages where the reader container
-                 * does not have a stable class/id.
-                 */
-                document.select(
-                    "img",
+    
+        val imageUrlRegex =
+            Regex(
+                """"imageUrl":"([^"]+)"""",
+            )
+    
+        /*
+         * 第一优先级：
+         *
+         * Next.js RSC 中的 imageUrl
+         *
+         * 只保留真正漫画图片。
+         */
+        val imageUrls =
+            imageUrlRegex
+                .findAll(
+                    html,
                 )
-            }
-
-        val urls =
-            imageElements
-                .mapNotNull { image ->
-
-                    firstNonBlank(
-
-                        /*
-                         * Lazy-loaded images.
-                         */
-
-                        image.absUrl(
-                            "data-src",
-                        ),
-
-                        image.absUrl(
-                            "data-original",
-                        ),
-
-                        image.absUrl(
-                            "data-lazy-src",
-                        ),
-
-                        /*
-                         * Normal image.
-                         */
-
-                        image.absUrl(
-                            "src",
-                        ),
-                    )
+                .map {
+                    it.groupValues[1]
                 }
                 .map {
                     decodeJsonUrl(
@@ -1007,39 +973,38 @@ abstract class Rouman5 : KeiSource() {
                     )
                 }
                 .filter {
-                    isValidImageUrl(
+                    isMangaImageUrl(
                         it,
                     )
                 }
                 .distinct()
                 .toList()
-
-        if (urls.isNotEmpty()) {
-
-            return urls.mapIndexed {
+    
+        if (
+            imageUrls.isNotEmpty()
+        ) {
+    
+            return imageUrls.mapIndexed {
                     index,
                     url,
                 ->
-
+    
                 Page(
                     index = index,
                     imageUrl = url,
                 )
             }
         }
-
+    
         /*
-         * ====================================================================
-         * Next.js fallback
-         * ====================================================================
+         * 第二优先级：
          *
-         * Some pages may not render the image as a normal <img>.
+         * 某些版本可能使用：
          *
-         * In that case try to extract the "images" array from
-         * the Next.js data instead of scanning every imageUrl
-         * in the entire RSC response.
+         * "images":[...]
+         *
+         * 继续从 Next.js 数据中寻找 URL。
          */
-
         val imagesBlock =
             Regex(
                 """"images":\[(.*?)]""",
@@ -1054,11 +1019,11 @@ abstract class Rouman5 : KeiSource() {
                 ?.getOrNull(
                     1,
                 )
-
+    
         if (
             !imagesBlock.isNullOrBlank()
         ) {
-
+    
             val dataUrls =
                 Regex(
                     """"(https?:\\/\\/[^"]+)"""",
@@ -1075,20 +1040,22 @@ abstract class Rouman5 : KeiSource() {
                         )
                     }
                     .filter {
-                        isValidImageUrl(
+                        isMangaImageUrl(
                             it,
                         )
                     }
                     .distinct()
                     .toList()
-
-            if (dataUrls.isNotEmpty()) {
-
+    
+            if (
+                dataUrls.isNotEmpty()
+            ) {
+    
                 return dataUrls.mapIndexed {
                         index,
                         url,
                     ->
-
+    
                     Page(
                         index = index,
                         imageUrl = url,
@@ -1096,28 +1063,47 @@ abstract class Rouman5 : KeiSource() {
                 }
             }
         }
-
+    
         /*
-         * Another fallback:
+         * 第三优先级：
          *
-         * Some Next.js payloads may contain imageUrl,
-         * but only use it as a final fallback.
+         * 部分页面可能真的把漫画图片放到了 <img>
+         * 中。
          *
-         * This is intentionally NOT the first parser.
+         * 但是这里仍然必须经过 isMangaImageUrl()
+         * 检查 /sr:1/。
          */
-
-        val imageUrlRegex =
-            Regex(
-                """"imageUrl":"([^"]+)"""",
+        val document =
+            Jsoup.parse(
+                html,
+                pageUrl,
             )
-
-        val fallbackUrls =
-            imageUrlRegex
-                .findAll(
-                    html,
+    
+        val htmlImageUrls =
+            document
+                .select(
+                    "img",
                 )
-                .map {
-                    it.groupValues[1]
+                .mapNotNull { image ->
+    
+                    firstNonBlank(
+    
+                        image.absUrl(
+                            "data-src",
+                        ),
+    
+                        image.absUrl(
+                            "data-original",
+                        ),
+    
+                        image.absUrl(
+                            "data-lazy-src",
+                        ),
+    
+                        image.absUrl(
+                            "src",
+                        ),
+                    )
                 }
                 .map {
                     decodeJsonUrl(
@@ -1125,49 +1111,49 @@ abstract class Rouman5 : KeiSource() {
                     )
                 }
                 .filter {
-                    isValidImageUrl(
+                    isMangaImageUrl(
                         it,
                     )
                 }
                 .distinct()
                 .toList()
-
-        if (fallbackUrls.isNotEmpty()) {
-
-            return fallbackUrls.mapIndexed {
+    
+        if (
+            htmlImageUrls.isNotEmpty()
+        ) {
+    
+            return htmlImageUrls.mapIndexed {
                     index,
                     url,
                 ->
-
+    
                 Page(
                     index = index,
                     imageUrl = url,
                 )
             }
         }
-
-        /*
-         * Do not throw an exception here.
-         *
-         * KeiSource recommends returning an empty page list
-         * when a chapter contains no pages.
-         */
-
+    
         return emptyList()
     }
 
     // ========================================================================
-    // 图片 URL 验证
+    // 判断是否为真正的漫画图片
     // ========================================================================
-
-    private fun isValidImageUrl(
+    
+    private fun isMangaImageUrl(
         url: String,
     ): Boolean {
-
-        if (url.isBlank()) {
+    
+        if (
+            url.isBlank()
+        ) {
             return false
         }
-
+    
+        /*
+         * 必须是 HTTP/HTTPS 图片。
+         */
         if (
             !url.startsWith(
                 "http://",
@@ -1178,14 +1164,41 @@ abstract class Rouman5 : KeiSource() {
         ) {
             return false
         }
-
+    
         val lower =
             url.lowercase()
-
+    
         /*
-         * Ignore common non-reader images.
+         * ================================================================
+         * 核心判断
+         * ================================================================
+         *
+         * 肉漫屋真正的漫画图片 URL 使用：
+         *
+         *     /sr:1/
+         *
+         * 例如：
+         *
+         *     https://xxx/.../sr:1/xxxx.jpg
+         *
+         * 广告、logo、banner 等不会满足这个条件。
+         *
+         * 这是这次修复最重要的一条。
          */
-
+        if (
+            !lower.contains(
+                "/sr:1/",
+            )
+        ) {
+            return false
+        }
+    
+        /*
+         * ================================================================
+         * 二次排除
+         * ================================================================
+         */
+    
         val blocked =
             listOf(
                 "favicon",
@@ -1198,25 +1211,65 @@ abstract class Rouman5 : KeiSource() {
                 "thumb",
                 "doubleclick",
                 "googlead",
-                "ads.",
+                "googlesyndication",
+                "adservice",
+                "advert",
+                "advertising",
+                "promotion",
                 "/ads/",
+                "ads.",
             )
-
-        return blocked.none {
-            lower.contains(
-                it,
-            )
+    
+        if (
+            blocked.any {
+                lower.contains(
+                    it,
+                )
+            }
+        ) {
+            return false
         }
+    
+        /*
+         * ================================================================
+         * 图片扩展名检查
+         * ================================================================
+         */
+    
+        val extension =
+            lower
+                .substringBefore(
+                    "?",
+                )
+                .substringAfterLast(
+                    ".",
+                    "",
+                )
+    
+        if (
+            extension.isNotBlank() &&
+            extension !in setOf(
+                "jpg",
+                "jpeg",
+                "png",
+                "webp",
+                "gif",
+            )
+        ) {
+            return false
+        }
+    
+        return true
     }
 
     // ========================================================================
     // Decode JSON URL
     // ========================================================================
-
+    
     private fun decodeJsonUrl(
         url: String,
     ): String {
-
+    
         return url
             .replace(
                 "\\/",
@@ -1238,6 +1291,27 @@ abstract class Rouman5 : KeiSource() {
                 "\\u003a",
                 ":",
             )
+            .replace(
+                "\\u003F",
+                "?",
+            )
+            .replace(
+                "\\u003f",
+                "?",
+            )
+            .replace(
+                "\\u003D",
+                "=",
+            )
+            .replace(
+                "\\u003d",
+                "=",
+            )
+            .replace(
+                "\\u0026",
+                "&",
+            )
+            .trim()
     }
 
     // ========================================================================
