@@ -8,21 +8,24 @@
   "extensionList": {
     "extensions": [
       {
-        "name": "\u8089\u6f2b\u5c4b",
+        "name": "Rouman5",
         "packageName": "eu.kanade.tachiyomi.extension.zh.rouman5",
         "resources": {
-          "apkUrl": "https://raw.githubusercontent.com/joker1001s/rouman5-tachimanga/repo/apk/tachiyomi-zh.rouman5-v1.6.1.apk"
+          "apkUrl": "https://raw.githubusercontent.com/joker1001s/rouman5-tachimanga/repo/apk/tachiyomi-zh.rouman5-v1.6.1.apk",
+          "iconUrl": "https://raw.githubusercontent.com/joker1001s/rouman5-tachimanga/repo/icon/eu.kanade.tachiyomi.extension.zh.rouman5.png",
+          "jarUrl": "https://raw.githubusercontent.com/joker1001s/rouman5-tachimanga/repo/jar/tachiyomi-zh.rouman5-v1.6.1.jar"
         },
         "extensionLib": "1.6",
-        "versionCode": "1",
+        "versionCode": 106001,
         "versionName": "1.6.1",
         "contentWarning": "CONTENT_WARNING_NSFW",
         "sources": [
           {
-            "id": "6000000000000099",
-            "name": "\u8089\u6f2b\u5c4b",
+            "id": 6000000000000099,
+            "name": "肉漫屋",
             "language": "zh",
-            "homeUrl": "https://rouman5.com"
+            "homeUrl": "https://rouman5.com",
+            "mirrorUrls": []
           }
         ]
       }
