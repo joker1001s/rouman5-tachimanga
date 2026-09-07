@@ -340,7 +340,7 @@ abstract class Rouman5 : KeiSource() {
                     .substringAfter("/books/$id/")
                     .trim('/')
 
-                val name = link.text()
+                val name = link.text().trim()
 
                 if (
                     chapterId.isBlank() ||
@@ -349,10 +349,10 @@ abstract class Rouman5 : KeiSource() {
                 ) {
                     null
                 } else {
-                    SChapter.create().apply {
-                        url = "$id/$chapterId"
-                        this.name = name
-                    }
+                    SChapter.create(
+                        url = "$id/$chapterId",
+                        name = name,
+                    )
                 }
             }
             .distinctBy { it.url }
