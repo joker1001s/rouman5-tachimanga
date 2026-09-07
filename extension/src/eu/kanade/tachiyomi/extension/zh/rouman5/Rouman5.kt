@@ -1,5 +1,6 @@
 package eu.kanade.tachiyomi.extension.zh.rouman5
 
+import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
@@ -7,29 +8,186 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
-import keiyoushi.network.get
 import keiyoushi.source.KeiSource
+import keiyoushi.network.get
 import okhttp3.HttpUrl
+import okhttp3.Request
+import okhttp3.Response
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
-import org.json.JSONObject
 import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
 
 @Source
 abstract class Rouman5 : KeiSource() {
 
     override val supportsLatest = true
 
-    // =========================================================================
+    // ========================================================================
+    // 热门漫画
+    // ========================================================================
+
+    override suspend fun getPopularManga(
+        page: Int,
+    ): MangasPage {
+
+        val url = "$baseUrl/home"
+
+        val response = client.get(url)
+
+        val document = Jsoup.parse(
+            response.body.string(),
+            url,
+        )
+
+        return parseHomePage(
+            document,
+            Regex("正熱門|今日最佳|本週熱門"),
+        )
+    }
+
+    private fun parseHomePage(
+        document: Document,
+        sectionRegex: Regex,
+    ): MangasPage {
+
+        val entries = mutableListOf<SManga>()
+
+        /*
+         * 肉漫屋首页结构：
+         *
+         * div.px-1
+         *   ├── section
+         *   ├── section
+         *   ├── section
+         *
+         * 根据 section 标题判断热门分类。
+         */
+
+        val container =
+            document.selectFirst("div.px-1")
+
+        if (container != null) {
+
+            for (section in container.children()) {
+
+                val text = section.text()
+
+                if (!sectionRegex.containsMatchIn(text)) {
+                    continue
+                }
+
+                entries += parseEntries(section)
+            }
+        }
+
+        return MangasPage(
+            entries.distinctBy { it.url },
+            false,
+        )
+    }
+
+    // ========================================================================
+    // 最新更新
+    // ========================================================================
+
+    override suspend fun getLatestUpdates(
+        page: Int,
+    ): MangasPage {
+
+        val url = "$baseUrl/home"
+
+        val response = client.get(url)
+
+        val document = Jsoup.parse(
+            response.body.string(),
+            url,
+        )
+
+        return parseHomePage(
+            document,
+            Regex("最近更新"),
+        )
+    }
+
+    // ========================================================================
+    // 首页漫画解析
+    // ========================================================================
+
+    private fun parseEntries(
+        container: Element,
+    ): List<SManga> {
+
+        return container
+            .select("a[href*=\"/books/\"]")
+            .mapNotNull { element ->
+
+                val href =
+                    element.absUrl("href")
+
+                if (
+                    href.isBlank() ||
+                    !href.contains("/books/")
+                ) {
+                    return@mapNotNull null
+                }
+
+                val title =
+                    firstNonBlank(
+                        element.selectFirst("div.truncate")?.text(),
+                        element.selectFirst("h1")?.text(),
+                        element.selectFirst("h2")?.text(),
+                        element.selectFirst("h3")?.text(),
+                        element.text(),
+                    )
+
+                if (title.isBlank()) {
+                    return@mapNotNull null
+                }
+
+                val image =
+                    firstNonBlank(
+                        element
+                            .selectFirst("img")
+                            ?.absUrl("src"),
+
+                        element
+                            .selectFirst("img")
+                            ?.absUrl("data-src"),
+
+                        element
+                            .selectFirst("img")
+                            ?.absUrl("data-original"),
+                    )
+
+                SManga.create().apply {
+
+                    setUrlWithoutDomain(href)
+
+                    this.title =
+                        cleanMangaTitle(title)
+
+                    if (image.isNotBlank()) {
+                        thumbnail_url = image
+                    }
+                }
+            }
+            .distinctBy {
+                it.url
+            }
+    }
+
+    // ========================================================================
     // 搜索
-    // =========================================================================
+    // ========================================================================
 
     override suspend fun getSearchMangaList(
         page: Int,
         query: String,
         filters: FilterList,
     ): MangasPage {
+
         if (query.isBlank()) {
             return MangasPage(
                 emptyList(),
@@ -37,159 +195,56 @@ abstract class Rouman5 : KeiSource() {
             )
         }
 
-        val searchUrl =
-            "$baseUrl/search?term=${encode(query)}"
-
-        val body = client.get(searchUrl).use { response ->
-            response.body.string()
-        }
-
-        val document = Jsoup.parse(
-            body,
-            searchUrl,
-        )
-
-        val mangas = document
-            .select("a[href*=\"/books/\"]")
-            .mapNotNull {
-                parseSearchManga(it)
-            }
-            .distinctBy {
-                it.url
-            }
-
-        return MangasPage(
-            mangas,
-            false,
-        )
-    }
-
-    private fun parseSearchManga(
-        element: Element,
-    ): SManga? {
-        val href = element.absUrl("href")
-
-        if (
-            href.isBlank() ||
-            !href.contains("/books/")
-        ) {
-            return null
-        }
-
-        val title = firstNonBlank(
-            element.selectFirst("h1")?.text(),
-            element.selectFirst("h2")?.text(),
-            element.selectFirst("h3")?.text(),
-            element.selectFirst("h4")?.text(),
-            element.selectFirst(".title")?.text(),
-            element.text(),
-        )
-
-        if (title.isBlank()) {
-            return null
-        }
-
-        return SManga.create().apply {
-            setUrlWithoutDomain(href)
-
-            this.title = cleanMangaTitle(title)
-
-            val image = firstNonBlank(
-                element.selectFirst("img")
-                    ?.absUrl("src"),
-
-                element.selectFirst("img")
-                    ?.absUrl("data-src"),
-
-                element.selectFirst("img")
-                    ?.absUrl("data-original"),
+        val encodedQuery =
+            URLEncoder.encode(
+                query,
+                StandardCharsets.UTF_8.name(),
             )
 
-            if (image.isNotBlank()) {
-                thumbnail_url = image
-            }
-        }
-    }
+        /*
+         * Roumanwu 原实现：
+         *
+         * /search?term=xxx&page=0
+         *
+         * 注意这里是 page - 1。
+         */
 
-    // =========================================================================
-    // 热门
-    // =========================================================================
-    
-    override suspend fun getPopularManga(
-        page: Int,
-    ): MangasPage {
-    
-        val url = baseUrl
-    
-        val body = client.get(url).use { response ->
-            if (!response.isSuccessful) {
-                throw IllegalStateException(
-                    "Failed to load popular manga: HTTP ${response.code}",
-                )
-            }
-    
-            response.body.string()
-        }
-    
-        val document = Jsoup.parse(
-            body,
-            url,
-        )
-    
-        val mangas = document
-            .select("a[href*=\"/books/\"]")
-            .mapNotNull {
-                parseSearchManga(it)
-            }
-            .distinctBy {
-                it.url
-            }
-    
-        return MangasPage(
-            mangas,
-            false,
-        )
-    }
-    
-    // =========================================================================
-    // 最新
-    // =========================================================================
+        val url =
+            "$baseUrl/search?term=$encodedQuery&page=${page - 1}"
 
-    override suspend fun getLatestUpdates(
-        page: Int,
-    ): MangasPage {
-        val body = client.get(baseUrl).use { response ->
-            response.body.string()
-        }
+        val response =
+            client.get(url)
 
-        val document = Jsoup.parse(
-            body,
-            baseUrl,
-        )
+        val document =
+            Jsoup.parse(
+                response.body.string(),
+                url,
+            )
 
-        val mangas = document
-            .select("a[href*=\"/books/\"]")
-            .mapNotNull {
-                parseSearchManga(it)
-            }
-            .distinctBy {
-                it.url
-            }
+        val entries =
+            parseEntries(document)
+
+        val hasNextPage =
+            document.selectFirst(
+                "div.justify-end > a:contains(下一頁)",
+            ) != null
 
         return MangasPage(
-            mangas,
-            false,
+            entries,
+            hasNextPage,
         )
     }
 
-    // =========================================================================
+    // ========================================================================
     // 漫画详情
-    // =========================================================================
+    // ========================================================================
 
     override suspend fun getMangaByUrl(
         url: HttpUrl,
     ): SManga? {
-        val mangaId = extractMangaId(url)
+
+        val mangaId =
+            extractMangaId(url)
 
         if (mangaId.isBlank()) {
             return null
@@ -198,14 +253,14 @@ abstract class Rouman5 : KeiSource() {
         val mangaUrl =
             "$baseUrl/books/$mangaId"
 
-        val body = client.get(mangaUrl).use { response ->
-            response.body.string()
-        }
+        val response =
+            client.get(mangaUrl)
 
-        val document = Jsoup.parse(
-            body,
-            mangaUrl,
-        )
+        val document =
+            Jsoup.parse(
+                response.body.string(),
+                mangaUrl,
+            )
 
         return parseManga(
             document,
@@ -213,9 +268,9 @@ abstract class Rouman5 : KeiSource() {
         )
     }
 
-    // =========================================================================
-    // 更新漫画
-    // =========================================================================
+    // ========================================================================
+    // 漫画详情 + 章节
+    // ========================================================================
 
     override suspend fun fetchMangaUpdate(
         manga: SManga,
@@ -223,6 +278,7 @@ abstract class Rouman5 : KeiSource() {
         fetchDetails: Boolean,
         fetchChapters: Boolean,
     ): SMangaUpdate {
+
         val mangaId =
             extractMangaId(manga.url)
 
@@ -236,14 +292,14 @@ abstract class Rouman5 : KeiSource() {
         val mangaUrl =
             "$baseUrl/books/$mangaId"
 
-        val body = client.get(mangaUrl).use { response ->
-            response.body.string()
-        }
+        val response =
+            client.get(mangaUrl)
 
-        val document = Jsoup.parse(
-            body,
-            mangaUrl,
-        )
+        val document =
+            Jsoup.parse(
+                response.body.string(),
+                mangaUrl,
+            )
 
         val updatedManga =
             if (fetchDetails) {
@@ -271,129 +327,221 @@ abstract class Rouman5 : KeiSource() {
         )
     }
 
-    // =========================================================================
-    // 漫画详情解析
-    // =========================================================================
+    // ========================================================================
+    // 解析漫画详情
+    // ========================================================================
 
     private fun parseManga(
         document: Document,
         mangaId: String,
     ): SManga {
-        val manga = SManga.create()
+
+        val manga =
+            SManga.create()
 
         manga.setUrlWithoutDomain(
             "$baseUrl/books/$mangaId",
         )
 
-        val title = firstNonBlank(
-            document.selectFirst("h1")?.text(),
+        /*
+         * 优先按照 Roumanwu 的实际页面结构解析。
+         */
 
-            document
-                .selectFirst(
+        val title =
+            firstNonBlank(
+                document.selectFirst(
+                    "div.basis-3\\/5 > div.text-xl",
+                )?.text(),
+
+                document.selectFirst("h1")?.text(),
+
+                document.selectFirst(
                     "meta[property=og:title]",
-                )
-                ?.attr("content"),
+                )?.attr("content"),
 
-            document
-                .selectFirst(
-                    "meta[name=twitter:title]",
-                )
-                ?.attr("content"),
-
-            document.title(),
-        )
-
-        if (title.isBlank()) {
-            throw IllegalStateException(
-                "Missing manga title: $baseUrl/books/$mangaId",
+                document.title(),
             )
-        }
 
         manga.title =
             cleanMangaTitle(title)
 
-        val thumbnail = firstNonBlank(
-            document
-                .selectFirst(
-                    "meta[property=og:image]",
-                )
-                ?.attr("content"),
+        /*
+         * 封面
+         */
 
-            document
-                .selectFirst(
-                    "meta[name=twitter:image]",
-                )
-                ?.attr("content"),
+        val thumbnail =
+            firstNonBlank(
 
-            document
-                .selectFirst("img")
-                ?.absUrl("src"),
+                document
+                    .selectFirst(
+                        "div.basis-2\\/5 img",
+                    )
+                    ?.absUrl("src"),
 
-            document
-                .selectFirst("img")
-                ?.absUrl("data-src"),
+                document
+                    .selectFirst(
+                        "meta[property=og:image]",
+                    )
+                    ?.attr("content"),
 
-            document
-                .selectFirst("img")
-                ?.absUrl("data-original"),
-        )
+                document
+                    .selectFirst("img")
+                    ?.absUrl("src"),
+
+                document
+                    .selectFirst("img")
+                    ?.absUrl("data-src"),
+            )
 
         if (thumbnail.isNotBlank()) {
-            manga.thumbnail_url = thumbnail
+            manga.thumbnail_url =
+                thumbnail
         }
 
-        val author = document
-            .selectFirst(
-                "a[href*=\"/authors/\"], .author, [class*=author]",
+        /*
+         * 尝试读取信息框。
+         */
+
+        val info =
+            document.selectFirst(
+                "div.basis-3\\/5",
             )
-            ?.text()
-            ?.trim()
 
-        if (!author.isNullOrBlank()) {
-            manga.author = author
-        }
+        if (info != null) {
 
-        val description = document
-            .selectFirst(
-                ".description, .summary, [class*=description], [class*=summary]",
-            )
-            ?.text()
-            ?.trim()
+            val lines =
+                info.children()
+                    .map {
+                        it.text().trim()
+                    }
+                    .filter {
+                        it.isNotBlank()
+                    }
 
-        if (!description.isNullOrBlank()) {
-            manga.description = description
-        }
+            val genres =
+                mutableListOf<String>()
 
-        val genres = document
-            .select(
-                "a[href*=\"/tags/\"], .tag, [class*=tag]",
-            )
-            .map {
-                it.text().trim()
+            for (line in lines) {
+
+                when {
+
+                    line.startsWith("作者:") -> {
+                        manga.author =
+                            line.removePrefix("作者:")
+                                .trim()
+                    }
+
+                    line.startsWith("狀態:") -> {
+
+                        val value =
+                            line.removePrefix("狀態:")
+                                .trim()
+
+                        manga.status =
+                            when (value) {
+                                "連載中" ->
+                                    SManga.ONGOING
+
+                                "已完結" ->
+                                    SManga.COMPLETED
+
+                                else ->
+                                    SManga.UNKNOWN
+                            }
+                    }
+
+                    line.startsWith("地區:") -> {
+
+                        val value =
+                            line.removePrefix("地區:")
+                                .trim()
+
+                        if (value.isNotBlank()) {
+                            genres += value
+                        }
+                    }
+
+                    line.startsWith("標籤:") -> {
+
+                        val value =
+                            line.removePrefix("標籤:")
+                                .trim()
+
+                        if (value.isNotBlank()) {
+
+                            genres +=
+                                value
+                                    .split(",")
+                                    .map {
+                                        it.trim()
+                                    }
+                                    .filter {
+                                        it.isNotBlank()
+                                    }
+                        }
+                    }
+                }
             }
-            .filter {
-                it.isNotBlank()
-            }
-            .distinct()
 
-        if (genres.isNotEmpty()) {
-            manga.genre =
-                genres.joinToString(", ")
+            if (genres.isNotEmpty()) {
+                manga.genre =
+                    genres.distinct()
+                        .joinToString(", ")
+            }
         }
 
-        manga.status = SManga.COMPLETED
+        /*
+         * 简介
+         */
+
+        val description =
+            firstNonBlank(
+
+                document
+                    .selectFirst(
+                        "p:contains(簡介:)",
+                    )
+                    ?.text()
+                    ?.removePrefix("簡介:")
+                    ?.trim(),
+
+                document
+                    .selectFirst(
+                        ".description",
+                    )
+                    ?.text(),
+
+                document
+                    .selectFirst(
+                        ".summary",
+                    )
+                    ?.text(),
+            )
+
+        if (description.isNotBlank()) {
+            manga.description =
+                description
+        }
+
+        if (
+            manga.status == 0
+        ) {
+            manga.status =
+                SManga.UNKNOWN
+        }
 
         return manga
     }
 
-    // =========================================================================
-    // 章节列表
-    // =========================================================================
+    // ========================================================================
+    // 章节
+    // ========================================================================
 
     private fun parseChapters(
         document: Document,
         mangaId: String,
     ): List<SChapter> {
+
         val prefix =
             "/books/$mangaId/"
 
@@ -401,7 +549,35 @@ abstract class Rouman5 : KeiSource() {
             .select(
                 "a[href*=\"$prefix\"]",
             )
+            .filter { element ->
+
+                /*
+                 * 必须是：
+                 *
+                 * /books/{mangaId}/{chapterId}
+                 *
+                 * 而不是：
+                 *
+                 * /books/{mangaId}
+                 */
+
+                val href =
+                    element.attr("href")
+
+                val path =
+                    href
+                        .substringBefore("?")
+                        .trim('/')
+
+                val parts =
+                    path.split('/')
+
+                parts.size >= 3 &&
+                    parts[0] == "books" &&
+                    parts[1] == mangaId
+            }
             .mapNotNull { link ->
+
                 val href =
                     link.absUrl("href")
 
@@ -427,14 +603,18 @@ abstract class Rouman5 : KeiSource() {
                 }
 
                 SChapter.create().apply {
+
                     setUrlWithoutDomain(
                         "$baseUrl/books/$mangaId/$chapterId",
                     )
 
-                    this.name = name
+                    this.name =
+                        name
 
                     chapter_number =
-                        extractChapterNumber(name)
+                        extractChapterNumber(
+                            name,
+                        )
 
                     date_upload = 0L
                 }
@@ -442,225 +622,166 @@ abstract class Rouman5 : KeiSource() {
             .distinctBy {
                 it.url
             }
-            .reversed()
+            .asReversed()
     }
 
-    // =========================================================================
-    // ★★★★★ 阅读页面
+    // ========================================================================
+    // ★★★ 阅读章节 ★★★
     //
-    // 不再加载网页中的 img。
+    // 这里是本次最重要的修改。
     //
-    // 直接请求：
+    // 不再请求：
     //
-    // /api/books/{mangaId}/{chapterId}
+    // /api/books/...
     //
-    // 然后读取：
+    // 而是请求：
     //
-    // chapter.images[].src
+    // /books/{mangaId}/{chapterId}
     //
-    // 因此网页广告不会进入 Tachimanga 阅读器。
-    // =========================================================================
+    // 并添加：
+    //
+    // rsc: 1
+    //
+    // 与你提供的 Roumanwu 源保持一致。
+    // ========================================================================
 
     override suspend fun getPageList(
         chapter: SChapter,
     ): List<Page> {
 
         val chapterUrl =
-            chapter.url.trim('/')
+            getChapterUrl(chapter)
 
-        val parts =
-            chapterUrl.split('/')
+        val request =
+            Request.Builder()
+                .url(chapterUrl)
+                .headers(headers)
+                .addHeader(
+                    "rsc",
+                    "1",
+                )
+                .get()
+                .build()
 
-        if (parts.size < 2) {
+        val response =
+            client.newCall(request)
+                .execute()
+
+        if (!response.isSuccessful) {
+
             throw IllegalStateException(
-                "Invalid chapter URL: ${chapter.url}",
+                "Chapter page failed: HTTP ${response.code}",
             )
         }
 
-        val mangaId =
-            parts[0]
+        val html =
+            response.body.string()
 
-        val chapterId =
-            parts[1]
+        if (html.isBlank()) {
 
-        if (
-            mangaId.isBlank() ||
-            chapterId.isBlank()
-        ) {
             throw IllegalStateException(
-                "Invalid manga/chapter ID: ${chapter.url}",
+                "Empty chapter response: $chapterUrl",
             )
         }
 
-        // 肉漫屋章节 API
-        val apiUrl =
-            "$baseUrl/api/books/$mangaId/$chapterId"
-
-        val body =
-            client.get(apiUrl).use { response ->
-
-                if (!response.isSuccessful) {
-                    throw IllegalStateException(
-                        "Chapter API failed: HTTP ${response.code}",
-                    )
-                }
-
-                response.body.string()
-            }
-
-        if (body.isBlank()) {
-            throw IllegalStateException(
-                "Empty chapter API response: $apiUrl",
-            )
-        }
-
-        val imageUrls =
-            parseChapterImages(body)
-
-        if (imageUrls.isEmpty()) {
-            throw IllegalStateException(
-                "No manga images found: $apiUrl",
-            )
-        }
-
-        return imageUrls.mapIndexed { index, imageUrl ->
-            Page(
-                index = index,
-                imageUrl = imageUrl,
-            )
-        }
+        return parsePages(
+            html,
+        )
     }
 
-    // =========================================================================
-    // API 图片解析
-    // =========================================================================
+    // ========================================================================
+    // 解析章节图片
+    // ========================================================================
 
-    private fun parseChapterImages(
-        body: String,
-    ): List<String> {
+    private fun parsePages(
+        html: String,
+    ): List<Page> {
 
-        val result =
-            mutableListOf<String>()
+        /*
+         * Roumanwu 的关键：
+         *
+         * "imageUrl":"https://..."
+         *
+         * 所以 Rouman5 也优先使用 imageUrl。
+         */
 
-        // ---------------------------------------------------------------------
-        // 第一种方式：标准 JSON
-        //
-        // {
-        //   "chapter": {
-        //     "images": [
-        //       {
-        //         "src": "https://..."
-        //       }
-        //     ]
-        //   }
-        // }
-        // ---------------------------------------------------------------------
+        val regex =
+            Regex(
+                """"imageUrl":"([^"]+)"""",
+            )
 
-        try {
-            val root =
-                JSONObject(body)
-
-            val chapterObject =
-                root.optJSONObject("chapter")
-
-            if (chapterObject != null) {
-
-                val images =
-                    chapterObject.optJSONArray("images")
-
-                if (images != null) {
-
-                    for (
-                        index in
-                        0 until images.length()
-                    ) {
-
-                        val image =
-                            images.optJSONObject(index)
-                                ?: continue
-
-                        val src =
-                            image
-                                .optString("src")
-                                .trim()
-
-                        if (
-                            isValidImageUrl(src)
-                        ) {
-                            result += src
-                        }
-                    }
-                }
-            }
-        } catch (_: Exception) {
-            // JSON 解析失败，进入备用解析
-        }
-
-        // ---------------------------------------------------------------------
-        // 第二种方式：备用正则
-        // ---------------------------------------------------------------------
-
-        if (result.isEmpty()) {
-
-            val regex =
-                Regex(
-                    """["']src["']\s*:\s*["'](https?://[^"']+)["']""",
-                )
-
+        val urls =
             regex
-                .findAll(body)
+                .findAll(html)
                 .map {
                     it.groupValues[1]
                 }
                 .map {
-                    it
-                        .replace("\\/", "/")
-                        .replace("\\u002F", "/")
+                    decodeJsonUrl(it)
                 }
                 .filter {
                     isValidImageUrl(it)
                 }
                 .distinct()
-                .forEach {
-                    result += it
+                .toList()
+
+        if (urls.isEmpty()) {
+
+            /*
+             * 备用：
+             *
+             * 如果 Next.js 返回的数据中字段变成 src，
+             * 再尝试 src。
+             */
+
+            val srcRegex =
+                Regex(
+                    """"src":"(https?://[^"]+)"""",
+                )
+
+            val fallback =
+                srcRegex
+                    .findAll(html)
+                    .map {
+                        it.groupValues[1]
+                    }
+                    .map {
+                        decodeJsonUrl(it)
+                    }
+                    .filter {
+                        isValidImageUrl(it)
+                    }
+                    .distinct()
+                    .toList()
+
+            if (fallback.isNotEmpty()) {
+
+                return fallback.mapIndexed { index, url ->
+
+                    Page(
+                        index = index,
+                        imageUrl = url,
+                    )
                 }
+            }
+
+            throw IllegalStateException(
+                "No manga images found in chapter response",
+            )
         }
 
-        // ---------------------------------------------------------------------
-        // 最终过滤
-        // ---------------------------------------------------------------------
+        return urls.mapIndexed { index, url ->
 
-        return result
-            .map {
-                it.trim()
-            }
-            .filter {
-                isValidImageUrl(it)
-            }
-            .filterNot {
-                it.contains(
-                    "loading",
-                    ignoreCase = true,
-                )
-            }
-            .filterNot {
-                it.contains(
-                    "placeholder",
-                    ignoreCase = true,
-                )
-            }
-            .filterNot {
-                it.contains(
-                    "avatar",
-                    ignoreCase = true,
-                )
-            }
-            .distinct()
+            Page(
+                index = index,
+                imageUrl = url,
+            )
+        }
     }
 
-    // =========================================================================
-    // 图片 URL 判断
-    // =========================================================================
+    // ========================================================================
+    // 图片 URL
+    // ========================================================================
 
     private fun isValidImageUrl(
         url: String,
@@ -671,8 +792,8 @@ abstract class Rouman5 : KeiSource() {
         }
 
         if (
-            !url.startsWith("https://") &&
-            !url.startsWith("http://")
+            !url.startsWith("http://") &&
+            !url.startsWith("https://")
         ) {
             return false
         }
@@ -680,7 +801,7 @@ abstract class Rouman5 : KeiSource() {
         val lower =
             url.lowercase()
 
-        val blockedKeywords =
+        val blocked =
             listOf(
                 "favicon",
                 "banner",
@@ -689,16 +810,30 @@ abstract class Rouman5 : KeiSource() {
                 "placeholder",
                 "doubleclick",
                 "googlead",
+                "ads.",
+                "/ads/",
             )
 
-        return blockedKeywords.none {
+        return blocked.none {
             lower.contains(it)
         }
     }
 
-    // =========================================================================
-    // 漫画 URL
-    // =========================================================================
+    private fun decodeJsonUrl(
+        url: String,
+    ): String {
+
+        return url
+            .replace("\\/", "/")
+            .replace("\\u002F", "/")
+            .replace("\\u002f", "/")
+            .replace("\\u003A", ":")
+            .replace("\\u003a", ":")
+    }
+
+    // ========================================================================
+    // Manga URL
+    // ========================================================================
 
     override fun getMangaUrl(
         manga: SManga,
@@ -708,6 +843,7 @@ abstract class Rouman5 : KeiSource() {
             manga.url.trim('/')
 
         return when {
+
             url.startsWith("http://") ||
                 url.startsWith("https://") -> {
                 url
@@ -723,9 +859,9 @@ abstract class Rouman5 : KeiSource() {
         }
     }
 
-    // =========================================================================
-    // 章节 URL
-    // =========================================================================
+    // ========================================================================
+    // Chapter URL
+    // ========================================================================
 
     override fun getChapterUrl(
         chapter: SChapter,
@@ -735,6 +871,7 @@ abstract class Rouman5 : KeiSource() {
             chapter.url.trim('/')
 
         return when {
+
             url.startsWith("http://") ||
                 url.startsWith("https://") -> {
                 url
@@ -750,13 +887,14 @@ abstract class Rouman5 : KeiSource() {
         }
     }
 
-    // =========================================================================
+    // ========================================================================
     // Manga ID
-    // =========================================================================
+    // ========================================================================
 
     private fun extractMangaId(
         url: HttpUrl,
     ): String {
+
         return extractMangaId(
             url.encodedPath,
         )
@@ -786,7 +924,9 @@ abstract class Rouman5 : KeiSource() {
             booksIndex >= 0 &&
             booksIndex + 1 < parts.size
         ) {
-            return parts[booksIndex + 1]
+            return parts[
+                booksIndex + 1
+            ]
         }
 
         return path
@@ -795,9 +935,9 @@ abstract class Rouman5 : KeiSource() {
             .trim()
     }
 
-    // =========================================================================
+    // ========================================================================
     // Chapter ID
-    // =========================================================================
+    // ========================================================================
 
     private fun extractChapterId(
         url: String,
@@ -808,16 +948,6 @@ abstract class Rouman5 : KeiSource() {
             url
                 .substringBefore("?")
                 .trim('/')
-
-        val prefix =
-            "books/$mangaId/"
-
-        if (path.startsWith(prefix)) {
-            return path
-                .removePrefix(prefix)
-                .substringBefore('/')
-                .trim()
-        }
 
         val parts =
             path.split('/')
@@ -834,17 +964,23 @@ abstract class Rouman5 : KeiSource() {
             booksIndex >= 0 &&
             booksIndex + 2 < parts.size
         ) {
-            return parts[
-                booksIndex + 2
-            ]
+
+            val id =
+                parts[
+                    booksIndex + 2
+                ]
+
+            if (id.isNotBlank()) {
+                return id
+            }
         }
 
         return ""
     }
 
-    // =========================================================================
+    // ========================================================================
     // Chapter number
-    // =========================================================================
+    // ========================================================================
 
     private fun extractChapterNumber(
         text: String,
@@ -862,9 +998,9 @@ abstract class Rouman5 : KeiSource() {
             ?: 0F
     }
 
-    // =========================================================================
+    // ========================================================================
     // 清理标题
-    // =========================================================================
+    // ========================================================================
 
     private fun cleanMangaTitle(
         title: String,
@@ -882,9 +1018,9 @@ abstract class Rouman5 : KeiSource() {
             .trim()
     }
 
-    // =========================================================================
+    // ========================================================================
     // 第一个非空字符串
-    // =========================================================================
+    // ========================================================================
 
     private fun firstNonBlank(
         vararg values: String?,
@@ -896,19 +1032,5 @@ abstract class Rouman5 : KeiSource() {
             }
             ?.trim()
             ?: ""
-    }
-
-    // =========================================================================
-    // URL Encode
-    // =========================================================================
-
-    private fun encode(
-        value: String,
-    ): String {
-
-        return URLEncoder.encode(
-            value,
-            Charsets.UTF_8.name(),
-        )
     }
 }
