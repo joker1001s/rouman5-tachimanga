@@ -1,0 +1,6 @@
+*.jks
+.gradle/
+build/
+upstream/
+.idea/
+*.iml
