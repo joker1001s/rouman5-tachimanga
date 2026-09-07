@@ -37,68 +37,122 @@ jobs:
           mkdir -p upstream/src/zh/rouman5
           cp -a extension/. upstream/src/zh/rouman5/
 
+      # 自动修复 Kotlin / Gradle / XML 格式
+      - name: Format source
+        working-directory: upstream
+        run: |
+          ./gradlew spotlessApply --no-daemon
+
+      # 构建 APK
       - name: Build debug APK
         working-directory: upstream
         run: |
           ./gradlew :src:zh:rouman5:assembleDebug --no-daemon
 
+      # 获取版本号
+      - name: Read version
+        id: version
+        run: |
+          set -euo pipefail
+
+          VERSION_CODE="$(grep -E '^    versionCode = ' extension/build.gradle.kts | sed -E 's/.*= ([0-9]+).*/\1/')"
+
+          if [ -z "$VERSION_CODE" ]; then
+            echo "::error::Unable to read versionCode."
+            exit 1
+          fi
+
+          VERSION_NAME="1.6.${VERSION_CODE}"
+          APK_NAME="tachiyomi-zh.rouman5-v${VERSION_NAME}.apk"
+
+          echo "VERSION_CODE=$VERSION_CODE" >> "$GITHUB_OUTPUT"
+          echo "VERSION_NAME=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+          echo "APK_NAME=$APK_NAME" >> "$GITHUB_OUTPUT"
+
+          echo "Version code: $VERSION_CODE"
+          echo "Version name: $VERSION_NAME"
+          echo "APK name: $APK_NAME"
+
+      # 准备 Android 签名工具
       - name: Prepare Android signing tool
         run: |
           SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+
           yes | "$SDKMANAGER" "build-tools;35.0.0" >/dev/null 2>&1 || true
+
           echo "$ANDROID_HOME/build-tools/35.0.0" >> "$GITHUB_PATH"
 
+      # 解码签名密钥
       - name: Decode signing key
         env:
           KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
         run: |
+          set -euo pipefail
+
           if [ -z "$KEYSTORE_B64" ]; then
             echo "::error::ANDROID_KEYSTORE_BASE64 is not configured."
             exit 1
           fi
+
           echo "$KEYSTORE_B64" | base64 --decode > rouman5-release.jks
 
+          if [ ! -s rouman5-release.jks ]; then
+            echo "::error::Keystore file is empty."
+            exit 1
+          fi
+
+      # 对 APK 进行签名
       - name: Sign APK
         env:
           KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          APK_NAME: ${{ steps.version.outputs.APK_NAME }}
         run: |
           set -euo pipefail
 
-          APK="$(find upstream/src/zh/rouman5/build/outputs/apk/debug -type f -name '*.apk' | head -n 1)"
+          APK="$(find upstream/src/zh/rouman5/build/outputs/apk/debug \
+            -type f \
+            -name '*.apk' \
+            | head -n 1)"
+
           if [ -z "$APK" ]; then
             echo "::error::APK not found."
             exit 1
           fi
 
+          echo "Found APK: $APK"
+
           mkdir -p publish
-          cp "$APK" "publish/tachiyomi-zh.rouman5-v1.6.1.apk"
+
+          cp "$APK" "publish/$APK_NAME"
 
           zipalign -p -f 4 \
-            "publish/tachiyomi-zh.rouman5-v1.6.1.apk" \
+            "publish/$APK_NAME" \
             "publish/aligned.apk"
 
-          mv "publish/aligned.apk" "publish/tachiyomi-zh.rouman5-v1.6.1.apk"
+          mv "publish/aligned.apk" "publish/$APK_NAME"
 
           apksigner sign \
             --ks rouman5-release.jks \
             --ks-pass "pass:$KEYSTORE_PASSWORD" \
             --ks-key-alias "$KEY_ALIAS" \
             --key-pass "pass:$KEY_PASSWORD" \
-            "publish/tachiyomi-zh.rouman5-v1.6.1.apk"
+            "publish/$APK_NAME"
 
-          apksigner verify --verbose "publish/tachiyomi-zh.rouman5-v1.6.1.apk"
+          apksigner verify --verbose "publish/$APK_NAME"
 
+          echo "APK signed successfully:"
+          ls -lh "publish/$APK_NAME"
+
+      # 生成 Tachimanga 仓库索引
       - name: Generate index
+        env:
+          VERSION_CODE: ${{ steps.version.outputs.VERSION_CODE }}
+          VERSION_NAME: ${{ steps.version.outputs.VERSION_NAME }}
+          APK_NAME: ${{ steps.version.outputs.APK_NAME }}
         run: |
           set -euo pipefail
-
-          VERSION_CODE="$(grep -E '^    versionCode = ' extension/build.gradle.kts | sed -E 's/.*= ([0-9]+).*/\\1/')"
-          VERSION_NAME="1.6.${VERSION_CODE}"
-          APK_NAME="tachiyomi-zh.rouman5-v${VERSION_NAME}.apk"
-
-          mv publish/tachiyomi-zh.rouman5-v1.6.1.apk "publish/$APK_NAME"
 
           cat > publish/index.min.json <<EOF
           [
@@ -127,6 +181,10 @@ jobs:
 
           python -m json.tool publish/index.min.json >/dev/null
 
+          echo "Generated index.min.json:"
+          cat publish/index.min.json
+
+      # 发布到 repo 分支
       - name: Publish repo branch
         run: |
           set -euo pipefail
@@ -137,14 +195,21 @@ jobs:
           git fetch origin repo || true
 
           rm -rf .repo-work
+
           if git show-ref --verify --quiet refs/remotes/origin/repo; then
             git worktree add --detach .repo-work origin/repo
             cd .repo-work
             git checkout -B repo
-            find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+
+            find . \
+              -mindepth 1 \
+              -maxdepth 1 \
+              ! -name .git \
+              -exec rm -rf {} +
           else
             git worktree add --detach .repo-work
             cd .repo-work
+
             git checkout --orphan repo
             git rm -rf . 2>/dev/null || true
           fi
@@ -153,9 +218,13 @@ jobs:
           cp ../publish/index.min.json .
 
           git add .
+
           git commit -m "Update Rouman5 extension" || true
+
           git push origin HEAD:repo --force
 
+      # 清理签名文件
       - name: Cleanup
         if: always()
-        run: rm -f rouman5-release.jks
+        run: |
+          rm -f rouman5-release.jks
