@@ -24,13 +24,15 @@ abstract class Rouman5 : KeiSource() {
 
     override val supportsLatest = true
 
+    // ========================================================================
+    // HTTP Client
+    // ========================================================================
+
     /**
-     * 肉漫屋漫画图片需要经过分块还原。
+     * 肉漫屋漫画图片存在分块倒序。
      *
      * KeiSource 的 client 是 final，
-     * 因此不能 override val client。
-     *
-     * 必须通过 configureClient() 添加拦截器。
+     * 所以通过 configureClient() 添加拦截器。
      */
     override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder {
         return addInterceptor(
@@ -42,13 +44,6 @@ abstract class Rouman5 : KeiSource() {
     // Filters
     // ========================================================================
 
-    /**
-     * Rouman5 currently provides three status filters:
-     *
-     * 全部
-     * 连载中
-     * 已完结
-     */
     private class StatusFilter : Filter.Select<String>(
         "状态",
         arrayOf(
@@ -67,7 +62,7 @@ abstract class Rouman5 : KeiSource() {
     }
 
     // ========================================================================
-    // 热门漫画
+    // 热门
     // ========================================================================
 
     override suspend fun getPopularManga(
@@ -93,60 +88,8 @@ abstract class Rouman5 : KeiSource() {
         )
     }
 
-    private fun parseHomePage(
-        document: Document,
-        sectionRegex: Regex,
-    ): MangasPage {
-
-        val entries =
-            mutableListOf<SManga>()
-
-        /*
-         * Rouman5 home page structure:
-         *
-         * div.px-1
-         *   ├── section
-         *   ├── section
-         *   └── section
-         */
-
-        val container =
-            document.selectFirst(
-                "div.px-1",
-            )
-
-        if (container != null) {
-
-            for (section in container.children()) {
-
-                val text =
-                    section.text()
-
-                if (
-                    !sectionRegex.containsMatchIn(
-                        text,
-                    )
-                ) {
-                    continue
-                }
-
-                entries +=
-                    parseEntries(
-                        section,
-                    )
-            }
-        }
-
-        return MangasPage(
-            entries.distinctBy {
-                it.url
-            },
-            false,
-        )
-    }
-
     // ========================================================================
-    // 最新更新
+    // 最新
     // ========================================================================
 
     override suspend fun getLatestUpdates(
@@ -173,8 +116,49 @@ abstract class Rouman5 : KeiSource() {
     }
 
     // ========================================================================
-    // 首页漫画解析
+    // 首页解析
     // ========================================================================
+
+    private fun parseHomePage(
+        document: Document,
+        sectionRegex: Regex,
+    ): MangasPage {
+
+        val container =
+            document.selectFirst(
+                "div.px-1",
+            )
+                ?: return MangasPage(
+                    emptyList(),
+                    false,
+                )
+
+        val entries =
+            container
+                .children()
+                .flatMap { section ->
+
+                    if (
+                        sectionRegex.containsMatchIn(
+                            section.text(),
+                        )
+                    ) {
+                        parseEntries(
+                            section,
+                        )
+                    } else {
+                        emptyList()
+                    }
+                }
+                .distinctBy {
+                    it.url
+                }
+
+        return MangasPage(
+            entries,
+            false,
+        )
+    }
 
     private fun parseEntries(
         container: Element,
@@ -192,10 +176,7 @@ abstract class Rouman5 : KeiSource() {
                     )
 
                 if (
-                    href.isBlank() ||
-                    !href.contains(
-                        "/books/",
-                    )
+                    href.isBlank()
                 ) {
                     return@mapNotNull null
                 }
@@ -209,52 +190,54 @@ abstract class Rouman5 : KeiSource() {
                             ?.text(),
 
                         element
-                            .selectFirst("h1")
+                            .selectFirst(
+                                "h1",
+                            )
                             ?.text(),
 
                         element
-                            .selectFirst("h2")
+                            .selectFirst(
+                                "h2",
+                            )
                             ?.text(),
 
                         element
-                            .selectFirst("h3")
+                            .selectFirst(
+                                "h3",
+                            )
                             ?.text(),
 
                         element.text(),
                     )
 
-                if (title.isBlank()) {
+                if (
+                    title.isBlank()
+                ) {
                     return@mapNotNull null
                 }
 
-                val imageElement =
-                    element.selectFirst(
-                        "img",
-                    )
-
                 val image =
-                    firstNonBlank(
-
-                        imageElement
-                            ?.absUrl(
-                                "src",
-                            ),
-
-                        imageElement
-                            ?.absUrl(
-                                "data-src",
-                            ),
-
-                        imageElement
-                            ?.absUrl(
-                                "data-original",
-                            ),
-
-                        imageElement
-                            ?.absUrl(
-                                "data-lazy-src",
-                            ),
-                    )
+                    element
+                        .selectFirst(
+                            "img",
+                        )
+                        ?.let {
+                            firstNonBlank(
+                                it.absUrl(
+                                    "src",
+                                ),
+                                it.absUrl(
+                                    "data-src",
+                                ),
+                                it.absUrl(
+                                    "data-original",
+                                ),
+                                it.absUrl(
+                                    "data-lazy-src",
+                                ),
+                            )
+                        }
+                        ?: ""
 
                 SManga.create().apply {
 
@@ -267,7 +250,9 @@ abstract class Rouman5 : KeiSource() {
                             title,
                         )
 
-                    if (image.isNotBlank()) {
+                    if (
+                        image.isNotBlank()
+                    ) {
                         thumbnail_url =
                             image
                     }
@@ -279,7 +264,7 @@ abstract class Rouman5 : KeiSource() {
     }
 
     // ========================================================================
-    // 搜索 + 筛选
+    // 搜索
     // ========================================================================
 
     override suspend fun getSearchMangaList(
@@ -288,26 +273,17 @@ abstract class Rouman5 : KeiSource() {
         filters: FilterList,
     ): MangasPage {
 
-        /*
-         * StatusFilter.state:
-         *
-         * 0 = 全部
-         * 1 = 连载中
-         * 2 = 已完结
-         */
-
         val statusFilter =
             filters.find {
                 it is StatusFilter
             } as? StatusFilter
 
         val continued =
-            when (statusFilter?.state) {
-
+            when (
+                statusFilter?.state
+            ) {
                 1 -> "true"
-
                 2 -> "false"
-
                 else -> null
             }
 
@@ -315,33 +291,19 @@ abstract class Rouman5 : KeiSource() {
             page - 1
 
         val url =
-            if (query.isBlank()) {
-
-                /*
-                 * 没有搜索关键词时：
-                 *
-                 * 全部：
-                 * /books?page=0
-                 *
-                 * 连载中：
-                 * /books?continued=true&page=0
-                 *
-                 * 已完结：
-                 * /books?continued=false&page=0
-                 */
+            if (
+                query.isBlank()
+            ) {
 
                 buildString {
 
                     append(
-                        "$baseUrl/books",
+                        "$baseUrl/books?page=$pageIndex",
                     )
 
-                    append(
-                        "?page=$pageIndex",
-                    )
-
-                    if (continued != null) {
-
+                    if (
+                        continued != null
+                    ) {
                         append(
                             "&continued=$continued",
                         )
@@ -349,16 +311,6 @@ abstract class Rouman5 : KeiSource() {
                 }
 
             } else {
-
-                /*
-                 * 搜索：
-                 *
-                 * /search?term=xxx&page=0
-                 *
-                 * 如果存在状态筛选，则追加：
-                 *
-                 * &continued=true
-                 */
 
                 val encodedQuery =
                     URLEncoder.encode(
@@ -369,19 +321,12 @@ abstract class Rouman5 : KeiSource() {
                 buildString {
 
                     append(
-                        "$baseUrl/search",
+                        "$baseUrl/search?term=$encodedQuery&page=$pageIndex",
                     )
 
-                    append(
-                        "?term=$encodedQuery",
-                    )
-
-                    append(
-                        "&page=$pageIndex",
-                    )
-
-                    if (continued != null) {
-
+                    if (
+                        continued != null
+                    ) {
                         append(
                             "&continued=$continued",
                         )
@@ -402,9 +347,6 @@ abstract class Rouman5 : KeiSource() {
                 document,
             )
 
-        /*
-         * Rouman5 currently uses "下一頁" for pagination.
-         */
         val hasNextPage =
             document.selectFirst(
                 "a:contains(下一頁)",
@@ -432,7 +374,9 @@ abstract class Rouman5 : KeiSource() {
                 url,
             )
 
-        if (mangaId.isBlank()) {
+        if (
+            mangaId.isBlank()
+        ) {
             return null
         }
 
@@ -453,81 +397,6 @@ abstract class Rouman5 : KeiSource() {
         )
     }
 
-    // ========================================================================
-    // 漫画详情 + 章节
-    // ========================================================================
-
-    override suspend fun fetchMangaUpdate(
-        manga: SManga,
-        chapters: List<SChapter>,
-        fetchDetails: Boolean,
-        fetchChapters: Boolean,
-    ): SMangaUpdate {
-
-        val mangaId =
-            extractMangaId(
-                manga.url,
-            )
-
-        if (mangaId.isBlank()) {
-            return SMangaUpdate(
-                manga,
-                chapters,
-            )
-        }
-
-        val mangaUrl =
-            "$baseUrl/books/$mangaId"
-
-        /*
-         * Details and chapters are on the same page,
-         * so one request is enough.
-         */
-
-        val document =
-            client.get(mangaUrl).use {
-                Jsoup.parse(
-                    it.body.string(),
-                    mangaUrl,
-                )
-            }
-
-        val updatedManga =
-            if (fetchDetails) {
-
-                parseManga(
-                    document,
-                    mangaId,
-                )
-
-            } else {
-
-                manga
-            }
-
-        val updatedChapters =
-            if (fetchChapters) {
-
-                parseChapters(
-                    document,
-                    mangaId,
-                )
-
-            } else {
-
-                chapters
-            }
-
-        return SMangaUpdate(
-            updatedManga,
-            updatedChapters,
-        )
-    }
-
-    // ========================================================================
-    // 解析漫画详情
-    // ========================================================================
-
     private fun parseManga(
         document: Document,
         mangaId: String,
@@ -544,29 +413,31 @@ abstract class Rouman5 : KeiSource() {
         // 标题
         // --------------------------------------------------------------------
 
-        val title =
-            firstNonBlank(
-
-                document.selectFirst(
-                    "div.basis-3\\/5 > div.text-xl",
-                )?.text(),
-
-                document.selectFirst(
-                    "h1",
-                )?.text(),
-
-                document.selectFirst(
-                    "meta[property=og:title]",
-                )?.attr(
-                    "content",
-                ),
-
-                document.title(),
-            )
-
         manga.title =
             cleanMangaTitle(
-                title,
+                firstNonBlank(
+                    document
+                        .selectFirst(
+                            "div.basis-3\\/5 > div.text-xl",
+                        )
+                        ?.text(),
+
+                    document
+                        .selectFirst(
+                            "h1",
+                        )
+                        ?.text(),
+
+                    document
+                        .selectFirst(
+                            "meta[property=og:title]",
+                        )
+                        ?.attr(
+                            "content",
+                        ),
+
+                    document.title(),
+                ),
             )
 
         // --------------------------------------------------------------------
@@ -609,8 +480,9 @@ abstract class Rouman5 : KeiSource() {
                     ),
             )
 
-        if (thumbnail.isNotBlank()) {
-
+        if (
+            thumbnail.isNotBlank()
+        ) {
             manga.thumbnail_url =
                 thumbnail
         }
@@ -624,94 +496,91 @@ abstract class Rouman5 : KeiSource() {
                 "div.basis-3\\/5",
             )
 
-        if (info != null) {
-
-            val lines =
-                info.children()
-                    .map {
-                        it.text().trim()
-                    }
-                    .filter {
-                        it.isNotBlank()
-                    }
+        if (
+            info != null
+        ) {
 
             val genres =
                 mutableListOf<String>()
 
-            for (line in lines) {
+            info.children()
+                .map {
+                    it.text()
+                }
+                .filter {
+                    it.isNotBlank()
+                }
+                .forEach { line ->
 
-                when {
+                    when {
 
-                    line.startsWith(
-                        "作者:",
-                    ) -> {
+                        line.startsWith(
+                            "作者:",
+                        ) -> {
 
-                        manga.author =
-                            line
-                                .removePrefix(
-                                    "作者:",
-                                )
-                                .trim()
-                    }
-
-                    line.startsWith(
-                        "狀態:",
-                    ) -> {
-
-                        val value =
-                            line
-                                .removePrefix(
-                                    "狀態:",
-                                )
-                                .trim()
-
-                        manga.status =
-                            when (value) {
-
-                                "連載中" ->
-                                    SManga.ONGOING
-
-                                "已完結" ->
-                                    SManga.COMPLETED
-
-                                else ->
-                                    SManga.UNKNOWN
-                            }
-                    }
-
-                    line.startsWith(
-                        "地區:",
-                    ) -> {
-
-                        val value =
-                            line
-                                .removePrefix(
-                                    "地區:",
-                                )
-                                .trim()
-
-                        if (
-                            value.isNotBlank()
-                        ) {
-                            genres +=
-                                value
+                            manga.author =
+                                line
+                                    .removePrefix(
+                                        "作者:",
+                                    )
+                                    .trim()
                         }
-                    }
 
-                    line.startsWith(
-                        "標籤:",
-                    ) -> {
+                        line.startsWith(
+                            "狀態:",
+                        ) -> {
 
-                        val value =
-                            line
-                                .removePrefix(
-                                    "標籤:",
-                                )
-                                .trim()
+                            val status =
+                                line
+                                    .removePrefix(
+                                        "狀態:",
+                                    )
+                                    .trim()
 
-                        if (
-                            value.isNotBlank()
-                        ) {
+                            manga.status =
+                                when (
+                                    status
+                                ) {
+                                    "連載中" ->
+                                        SManga.ONGOING
+
+                                    "已完結" ->
+                                        SManga.COMPLETED
+
+                                    else ->
+                                        SManga.UNKNOWN
+                                }
+                        }
+
+                        line.startsWith(
+                            "地區:",
+                        ) -> {
+
+                            val value =
+                                line
+                                    .removePrefix(
+                                        "地區:",
+                                    )
+                                    .trim()
+
+                            if (
+                                value.isNotBlank()
+                            ) {
+                                genres +=
+                                    value
+                            }
+                        }
+
+                        line.startsWith(
+                            "標籤:",
+                        ) -> {
+
+                            val value =
+                                line
+                                    .removePrefix(
+                                        "標籤:",
+                                    )
+                                    .trim()
 
                             genres +=
                                 value
@@ -725,17 +594,11 @@ abstract class Rouman5 : KeiSource() {
                         }
                     }
                 }
-            }
 
-            if (genres.isNotEmpty()) {
-
-                manga.genre =
-                    genres
-                        .distinct()
-                        .joinToString(
-                            ", ",
-                        )
-            }
+            manga.genre =
+                genres
+                    .distinct()
+                    .joinToString()
         }
 
         // --------------------------------------------------------------------
@@ -771,22 +634,69 @@ abstract class Rouman5 : KeiSource() {
         if (
             description.isNotBlank()
         ) {
-
             manga.description =
                 description
-        }
-
-        if (manga.status == 0) {
-
-            manga.status =
-                SManga.UNKNOWN
         }
 
         return manga
     }
 
     // ========================================================================
-    // 章节
+    // 更新漫画
+    // ========================================================================
+
+    override suspend fun fetchMangaUpdate(
+        manga: SManga,
+        chapters: List<SChapter>,
+        fetchDetails: Boolean,
+        fetchChapters: Boolean,
+    ): SMangaUpdate {
+
+        val mangaId =
+            extractMangaId(
+                manga.url,
+            )
+
+        if (
+            mangaId.isBlank()
+        ) {
+            return SMangaUpdate(
+                manga,
+                chapters,
+            )
+        }
+
+        val mangaUrl =
+            "$baseUrl/books/$mangaId"
+
+        val document =
+            client.get(mangaUrl).use {
+                Jsoup.parse(
+                    it.body.string(),
+                    mangaUrl,
+                )
+            }
+
+        val updatedManga =
+            parseManga(
+                document,
+                mangaId,
+            )
+
+        val updatedChapters =
+            parseChapters(
+                document,
+                mangaId,
+            )
+
+        return SMangaUpdate(
+            updatedManga,
+            updatedChapters,
+        )
+    }
+
+    // ========================================================================
+    // 章节列表
     // ========================================================================
 
     private fun parseChapters(
@@ -801,35 +711,6 @@ abstract class Rouman5 : KeiSource() {
             .select(
                 "a[href*=\"$prefix\"]",
             )
-            .filter { element ->
-
-                /*
-                 * Must be:
-                 *
-                 * /books/{mangaId}/{chapterId}
-                 *
-                 * rather than:
-                 *
-                 * /books/{mangaId}
-                 */
-
-                val href =
-                    element.attr(
-                        "href",
-                    )
-
-                val path =
-                    href
-                        .substringBefore("?")
-                        .trim('/')
-
-                val parts =
-                    path.split('/')
-
-                parts.size >= 3 &&
-                    parts[0] == "books" &&
-                    parts[1] == mangaId
-            }
             .mapNotNull { link ->
 
                 val href =
@@ -837,7 +718,9 @@ abstract class Rouman5 : KeiSource() {
                         "href",
                     )
 
-                if (href.isBlank()) {
+                if (
+                    href.isBlank()
+                ) {
                     return@mapNotNull null
                 }
 
@@ -847,14 +730,18 @@ abstract class Rouman5 : KeiSource() {
                         mangaId,
                     )
 
-                if (chapterId.isBlank()) {
+                if (
+                    chapterId.isBlank()
+                ) {
                     return@mapNotNull null
                 }
 
                 val name =
-                    link.text().trim()
+                    link.text()
 
-                if (name.isBlank()) {
+                if (
+                    name.isBlank()
+                ) {
                     return@mapNotNull null
                 }
 
@@ -871,9 +758,6 @@ abstract class Rouman5 : KeiSource() {
                         extractChapterNumber(
                             name,
                         )
-
-                    date_upload =
-                        0L
                 }
             }
             .distinctBy {
@@ -883,393 +767,122 @@ abstract class Rouman5 : KeiSource() {
     }
 
     // ========================================================================
-    // 阅读章节
+    // ★ 章节页面
+    // ★ 官方 Roumanwu RSC 方案
     // ========================================================================
-    
+
     override suspend fun getPageList(
         chapter: SChapter,
     ): List<Page> {
-    
+
         val chapterUrl =
             getChapterUrl(
                 chapter,
             )
-    
+
         /*
          * 肉漫屋使用 Next.js。
          *
-         * 章节页面中的漫画图片信息可能存在于：
+         * 普通 GET 得到的是普通 HTML，
+         * 漫画阅读数据位于 Next.js RSC 响应中。
          *
-         * 1. Next.js RSC 数据
-         * 2. imageUrl 字段
-         * 3. images 数组
+         * 因此必须发送：
          *
-         * 因此这里直接获取普通章节 HTML/RSC 页面，
-         * 后续统一由 parsePages() 提取。
+         *     rsc: 1
          *
-         * 不再直接使用 client.newCall().execute()，
-         * 因为 KeiSource 1.6 应使用 suspend client.get()。
+         * 官方 Roumanwu 实现就是这个方案。
          */
+
+        val rscHeaders =
+            headers.newBuilder()
+                .add(
+                    "rsc",
+                    "1",
+                )
+                .build()
+
         val html =
             client.get(
                 chapterUrl,
+                rscHeaders,
             ).use {
                 it.body.string()
             }
-    
-        if (html.isBlank()) {
+
+        if (
+            html.isBlank()
+        ) {
             return emptyList()
         }
-    
+
         return parsePages(
             html,
-            chapterUrl,
         )
     }
 
     // ========================================================================
-    // 解析章节图片
+    // ★ RSC 页面图片解析
     // ========================================================================
-    
+
     private fun parsePages(
         html: String,
-        pageUrl: String,
     ): List<Page> {
-    
+
         /*
-         * 肉漫屋当前漫画图片有非常明确的特征：
+         * 官方 Roumanwu：
          *
-         *     /sr:1/
+         * Regex(""""imageUrl":"([^"]+)"""")
          *
-         * 上游图片拦截器也是通过这个字段判断漫画图片。
+         * 这里不要：
          *
-         * 因此这里不再把普通 img、广告图片、
-         * banner、loading 图片等直接当作漫画页面。
+         * 1. 解析普通 <img>
+         * 2. 判断 /sr:1/
+         * 3. 判断图片扩展名
+         * 4. 判断广告关键词
+         *
+         * /sr:1/ 是图片下载阶段由
+         * ScrambledImageInterceptor 处理的。
          */
-    
-        val imageUrlRegex =
-            Regex(
-                """"imageUrl":"([^"]+)"""",
-            )
-    
-        /*
-         * 第一优先级：
-         *
-         * Next.js RSC 中的 imageUrl
-         *
-         * 只保留真正漫画图片。
-         */
-        val imageUrls =
-            imageUrlRegex
-                .findAll(
-                    html,
-                )
-                .map {
-                    it.groupValues[1]
-                }
-                .map {
-                    decodeJsonUrl(
-                        it,
-                    )
-                }
-                .filter {
-                    isMangaImageUrl(
-                        it,
-                    )
-                }
-                .distinct()
-                .toList()
-    
-        if (
-            imageUrls.isNotEmpty()
-        ) {
-    
-            return imageUrls.mapIndexed {
-                    index,
-                    url,
-                ->
-    
-                Page(
-                    index = index,
-                    imageUrl = url,
-                )
-            }
-        }
-    
-        /*
-         * 第二优先级：
-         *
-         * 某些版本可能使用：
-         *
-         * "images":[...]
-         *
-         * 继续从 Next.js 数据中寻找 URL。
-         */
-        val imagesBlock =
-            Regex(
-                """"images":\[(.*?)]""",
-                setOf(
-                    RegexOption.DOT_MATCHES_ALL,
-                ),
-            )
-                .find(
-                    html,
-                )
-                ?.groupValues
-                ?.getOrNull(
-                    1,
-                )
-    
-        if (
-            !imagesBlock.isNullOrBlank()
-        ) {
-    
-            val dataUrls =
-                Regex(
-                    """"(https?:\\/\\/[^"]+)"""",
-                )
-                    .findAll(
-                        imagesBlock,
-                    )
-                    .map {
-                        it.groupValues[1]
-                    }
-                    .map {
-                        decodeJsonUrl(
-                            it,
-                        )
-                    }
-                    .filter {
-                        isMangaImageUrl(
-                            it,
-                        )
-                    }
-                    .distinct()
-                    .toList()
-    
-            if (
-                dataUrls.isNotEmpty()
-            ) {
-    
-                return dataUrls.mapIndexed {
-                        index,
-                        url,
-                    ->
-    
-                    Page(
-                        index = index,
-                        imageUrl = url,
-                    )
-                }
-            }
-        }
-    
-        /*
-         * 第三优先级：
-         *
-         * 部分页面可能真的把漫画图片放到了 <img>
-         * 中。
-         *
-         * 但是这里仍然必须经过 isMangaImageUrl()
-         * 检查 /sr:1/。
-         */
-        val document =
-            Jsoup.parse(
+
+        return IMAGE_URL_REGEX
+            .findAll(
                 html,
-                pageUrl,
             )
-    
-        val htmlImageUrls =
-            document
-                .select(
-                    "img",
+            .map {
+                decodeJsonUrl(
+                    it.groupValues[1],
                 )
-                .mapNotNull { image ->
-    
-                    firstNonBlank(
-    
-                        image.absUrl(
-                            "data-src",
-                        ),
-    
-                        image.absUrl(
-                            "data-original",
-                        ),
-    
-                        image.absUrl(
-                            "data-lazy-src",
-                        ),
-    
-                        image.absUrl(
-                            "src",
-                        ),
+            }
+            .filter {
+                it.startsWith(
+                    "http://",
+                ) ||
+                    it.startsWith(
+                        "https://",
                     )
-                }
-                .map {
-                    decodeJsonUrl(
-                        it,
-                    )
-                }
-                .filter {
-                    isMangaImageUrl(
-                        it,
-                    )
-                }
-                .distinct()
-                .toList()
-    
-        if (
-            htmlImageUrls.isNotEmpty()
-        ) {
-    
-            return htmlImageUrls.mapIndexed {
+            }
+            .distinct()
+            .mapIndexed {
                     index,
                     url,
                 ->
-    
+
                 Page(
-                    index = index,
+                    index,
                     imageUrl = url,
                 )
             }
-        }
-    
-        return emptyList()
+            .toList()
     }
 
     // ========================================================================
-    // 判断是否为真正的漫画图片
+    // JSON URL 解码
     // ========================================================================
-    
-    private fun isMangaImageUrl(
-        url: String,
-    ): Boolean {
-    
-        if (
-            url.isBlank()
-        ) {
-            return false
-        }
-    
-        /*
-         * 必须是 HTTP/HTTPS 图片。
-         */
-        if (
-            !url.startsWith(
-                "http://",
-            ) &&
-            !url.startsWith(
-                "https://",
-            )
-        ) {
-            return false
-        }
-    
-        val lower =
-            url.lowercase()
-    
-        /*
-         * ================================================================
-         * 核心判断
-         * ================================================================
-         *
-         * 肉漫屋真正的漫画图片 URL 使用：
-         *
-         *     /sr:1/
-         *
-         * 例如：
-         *
-         *     https://xxx/.../sr:1/xxxx.jpg
-         *
-         * 广告、logo、banner 等不会满足这个条件。
-         *
-         * 这是这次修复最重要的一条。
-         */
-        if (
-            !lower.contains(
-                "/sr:1/",
-            )
-        ) {
-            return false
-        }
-    
-        /*
-         * ================================================================
-         * 二次排除
-         * ================================================================
-         */
-    
-        val blocked =
-            listOf(
-                "favicon",
-                "logo",
-                "banner",
-                "avatar",
-                "loading",
-                "placeholder",
-                "thumbnail",
-                "thumb",
-                "doubleclick",
-                "googlead",
-                "googlesyndication",
-                "adservice",
-                "advert",
-                "advertising",
-                "promotion",
-                "/ads/",
-                "ads.",
-            )
-    
-        if (
-            blocked.any {
-                lower.contains(
-                    it,
-                )
-            }
-        ) {
-            return false
-        }
-    
-        /*
-         * ================================================================
-         * 图片扩展名检查
-         * ================================================================
-         */
-    
-        val extension =
-            lower
-                .substringBefore(
-                    "?",
-                )
-                .substringAfterLast(
-                    ".",
-                    "",
-                )
-    
-        if (
-            extension.isNotBlank() &&
-            extension !in setOf(
-                "jpg",
-                "jpeg",
-                "png",
-                "webp",
-                "gif",
-            )
-        ) {
-            return false
-        }
-    
-        return true
-    }
 
-    // ========================================================================
-    // Decode JSON URL
-    // ========================================================================
-    
     private fun decodeJsonUrl(
         url: String,
     ): String {
-    
+
         return url
             .replace(
                 "\\/",
@@ -1333,19 +946,16 @@ abstract class Rouman5 : KeiSource() {
                 url.startsWith(
                     "https://",
                 ) -> {
-
                 url
             }
 
             url.startsWith(
                 "books/",
             ) -> {
-
                 "$baseUrl/$url"
             }
 
             else -> {
-
                 "$baseUrl/books/$url"
             }
         }
@@ -1370,19 +980,16 @@ abstract class Rouman5 : KeiSource() {
                 url.startsWith(
                     "https://",
                 ) -> {
-
                 url
             }
 
             url.startsWith(
                 "books/",
             ) -> {
-
                 "$baseUrl/$url"
             }
 
             else -> {
-
                 "$baseUrl/books/$url"
             }
         }
@@ -1405,13 +1012,11 @@ abstract class Rouman5 : KeiSource() {
         url: String,
     ): String {
 
-        val path =
+        val parts =
             url
                 .substringBefore("?")
                 .trim('/')
-
-        val parts =
-            path.split('/')
+                .split('/')
 
         val booksIndex =
             parts.indexOfFirst {
@@ -1425,18 +1030,12 @@ abstract class Rouman5 : KeiSource() {
             booksIndex >= 0 &&
             booksIndex + 1 < parts.size
         ) {
-
             return parts[
                 booksIndex + 1
             ]
         }
 
-        return path
-            .removePrefix(
-                "books/",
-            )
-            .substringBefore('/')
-            .trim()
+        return ""
     }
 
     // ========================================================================
@@ -1448,13 +1047,11 @@ abstract class Rouman5 : KeiSource() {
         mangaId: String,
     ): String {
 
-        val path =
+        val parts =
             url
                 .substringBefore("?")
                 .trim('/')
-
-        val parts =
-            path.split('/')
+                .split('/')
 
         val booksIndex =
             parts.indexOfFirst {
@@ -1469,35 +1066,39 @@ abstract class Rouman5 : KeiSource() {
             booksIndex + 2 < parts.size
         ) {
 
-            val id =
+            val currentMangaId =
                 parts[
-                    booksIndex + 2
+                    booksIndex + 1
                 ]
 
-            if (id.isNotBlank()) {
-                return id
+            if (
+                currentMangaId != mangaId
+            ) {
+                return ""
             }
+
+            return parts[
+                booksIndex + 2
+            ]
         }
 
         return ""
     }
 
     // ========================================================================
-    // Chapter number
+    // Chapter Number
     // ========================================================================
 
     private fun extractChapterNumber(
         text: String,
     ): Float {
 
-        val match =
-            Regex(
-                """(?i)(?:chapter|chap|第)\s*([0-9]+(?:\.[0-9]+)?)""",
-            ).find(
+        return Regex(
+            """(?i)(?:chapter|chap|第)\s*([0-9]+(?:\.[0-9]+)?)""",
+        )
+            .find(
                 text,
             )
-
-        return match
             ?.groupValues
             ?.getOrNull(
                 1,
@@ -1507,7 +1108,7 @@ abstract class Rouman5 : KeiSource() {
     }
 
     // ========================================================================
-    // Clean manga title
+    // Clean Title
     // ========================================================================
 
     private fun cleanMangaTitle(
@@ -1527,7 +1128,7 @@ abstract class Rouman5 : KeiSource() {
     }
 
     // ========================================================================
-    // First non-blank string
+    // Utility
     // ========================================================================
 
     private fun firstNonBlank(
@@ -1540,5 +1141,22 @@ abstract class Rouman5 : KeiSource() {
             }
             ?.trim()
             ?: ""
+    }
+
+    // ========================================================================
+    // Constants
+    // ========================================================================
+
+    companion object {
+
+        /**
+         * 肉漫屋 Next.js RSC 中的漫画图片字段。
+         *
+         * 官方 Roumanwu 使用同样的表达式。
+         */
+        private val IMAGE_URL_REGEX =
+            Regex(
+                """"imageUrl":"([^"]+)"""",
+            )
     }
 }
