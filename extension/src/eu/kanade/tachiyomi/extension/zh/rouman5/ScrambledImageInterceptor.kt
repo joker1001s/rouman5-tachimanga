@@ -12,21 +12,6 @@ import okhttp3.ResponseBody.Companion.asResponseBody
 import okio.Buffer
 import java.security.MessageDigest
 
-/**
- * 肉漫屋漫画图片还原拦截器。
- *
- * 肉漫屋的漫画图片 URL 通常包含：
- *
- *     /sr:1/
- *
- * 图片本身并不是按照正常顺序存储，
- * 而是被分成多个横向区块后倒序排列。
- *
- * 图片文件名经过 Base64 解码后，
- * 使用 MD5 最后一个字节计算区块数量。
- *
- * 算法来源于肉漫屋当前网页端的图片处理逻辑。
- */
 class ScrambledImageInterceptor : Interceptor {
 
     override fun intercept(
@@ -43,12 +28,11 @@ class ScrambledImageInterceptor : Interceptor {
             request.url
 
         /*
-         * 只有 /sr:1/ 的图片需要进行还原。
-         *
-         * 广告、封面、头像、logo 等普通图片
-         * 不进行处理。
+         * 只有 /sr:1/ 图片需要还原。
          */
-        if ("sr:1" !in url.pathSegments) {
+        if (
+            "sr:1" !in url.pathSegments
+        ) {
             return response
         }
 
@@ -62,7 +46,16 @@ class ScrambledImageInterceptor : Interceptor {
                     it.byteStream(),
                 )
             }
-                ?: return response
+
+        /*
+         * 如果服务器返回的并不是有效图片，
+         * 不进行处理。
+         */
+        if (
+            image == null
+        ) {
+            return response
+        }
 
         val width =
             image.width
@@ -78,79 +71,6 @@ class ScrambledImageInterceptor : Interceptor {
             return response
         }
 
-        /*
-         * 获取图片文件名。
-         *
-         * 例如：
-         *
-         *     /sr:1/xxxxxxxxxxxx.jpg
-         *
-         * 只取：
-         *
-         *     xxxxxxxxxxxx
-         */
-        val encodedName =
-            url.pathSegments
-                .lastOrNull()
-                ?.substringBeforeLast(
-                    ".",
-                )
-
-        if (
-            encodedName.isNullOrBlank()
-        ) {
-            image.recycle()
-            return response
-        }
-
-        val blocks =
-            try {
-
-                /*
-                 * Base64 解码文件名
-                 */
-                val decoded =
-                    Base64.decode(
-                        encodedName,
-                        Base64.DEFAULT,
-                    )
-
-                /*
-                 * MD5
-                 */
-                val digest =
-                    MessageDigest
-                        .getInstance("MD5")
-                        .digest(
-                            decoded,
-                        )
-
-                /*
-                 * 肉漫屋当前算法：
-                 *
-                 * lastByte % 10 + 5
-                 *
-                 * 最终区块数量：
-                 *
-                 * 5 ~ 14
-                 */
-                digest
-                    .last()
-                    .toPositiveInt() % 10 + 5
-
-            } catch (
-                _: Exception,
-            ) {
-
-                image.recycle()
-                return response
-            }
-
-        if (blocks <= 1) {
-            image.recycle()
-            return response
-        }
-
         val result =
             Bitmap.createBitmap(
                 width,
@@ -162,25 +82,67 @@ class ScrambledImageInterceptor : Interceptor {
             Canvas(result)
 
         /*
-         * 图片被按照横向区块分割。
+         * 肉漫屋官方算法：
          *
-         * 注意：
+         * 文件名
+         *     ↓
+         * Base64 decode
+         *     ↓
+         * MD5
+         *     ↓
+         * 最后一个 byte
+         *     ↓
+         * % 10 + 5
          *
-         * 如果 height 无法被 blocks 整除，
-         * 多出来的 remainder 位于底部区块。
+         * 得到图片分块数量。
          */
+        val blocks =
+            try {
+
+                url.pathSegments
+                    .last()
+                    .substringBeforeLast(
+                        '.',
+                    )
+                    .let {
+                        Base64.decode(
+                            it,
+                            Base64.DEFAULT,
+                        )
+                    }
+                    .let {
+                        MessageDigest
+                            .getInstance("MD5")
+                            .digest(
+                                it,
+                            )
+                    }
+                    .let {
+                        it.last()
+                            .toPositiveInt() % 10 + 5
+                    }
+
+            } catch (
+                _: Exception,
+            ) {
+
+                image.recycle()
+                result.recycle()
+
+                return response
+            }
+
         val blockHeight =
             height / blocks
 
         /*
-         * 原图从最后一个区块开始。
+         * scrambled 图片的最后一个区块
+         * 位于原始图片顶部。
          */
         var sourceY =
-            blockHeight * (blocks - 1)
+            blockHeight *
+                (blocks - 1)
 
-        /*
-         * 目标图片从顶部开始。
-         */
         var destinationY =
             0
 
@@ -189,10 +151,7 @@ class ScrambledImageInterceptor : Interceptor {
         ) {
 
             /*
-             * 第一个复制出来的区块，
-             * 实际对应原图最底部区块。
-             *
-             * 底部区块包含 remainder。
+             * remainder 在底部 scrambled block。
              */
             val currentHeight =
                 if (
@@ -227,13 +186,9 @@ class ScrambledImageInterceptor : Interceptor {
             )
 
             sourceY -= blockHeight
-
             destinationY += currentHeight
         }
 
-        /*
-         * Tachimanga 最终拿到正常 JPG。
-         */
         val newBody =
             Buffer().run {
 
@@ -253,11 +208,12 @@ class ScrambledImageInterceptor : Interceptor {
 
         return response
             .newBuilder()
-            .body(newBody)
+            .body(
+                newBody,
+            )
             .build()
     }
 
-    private fun Byte.toPositiveInt(): Int {
-        return toInt() and 0xFF
-    }
+    private fun Byte.toPositiveInt(): Int =
+        toInt() and 0xFF
 }
